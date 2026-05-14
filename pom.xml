@@ -18,6 +18,7 @@
 		<module>fractals</module>
 		<module>dna</module>
 		<module>grayscott</module>
+		<module>loadbalancer</module>
 	</modules>
 
 </project>

@@ -10,7 +10,8 @@ import pt.ulisboa.tecnico.cnv.grayscott.GrayScottHandler;
 
 public class WebServer {
     public static void main(String[] args) throws Exception {
-        HttpServer server = HttpServer.create(new InetSocketAddress(8000), 0);
+        int port = args.length > 0 ? Integer.parseInt(args[0]) : 8000;
+        HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
         server.setExecutor(java.util.concurrent.Executors.newCachedThreadPool());
         server.createContext("/", new RootHandler());
         server.createContext("/fractals", new FractalsHandler());
