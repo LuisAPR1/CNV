@@ -1,7 +1,11 @@
 package pt.ulisboa.tecnico.cnv.javassist;
 
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentLinkedDeque;
 
 /**
  * Thread-local metric collection for instrumented request handling.
@@ -9,31 +13,141 @@ import java.util.Map;
  */
 public class MetricRegistry {
 
+    private static final int MAX_COMPLETED_METRICS = 1000;
+
     /**
-     * Holds per-request metrics for the current thread.
+     * Immutable snapshot of a completed request's metrics.
+     * Created at the end of each request for storage and analysis.
+     */
+    public static class CompletedRequest {
+        private final String requestType;
+        private final Map<String, String> parameters;
+        private final long methodCallCount;
+        private final long basicBlockCount;
+        private final long elapsedTimeMs;
+        private final long timestamp;
+
+        public CompletedRequest(String requestType, Map<String, String> parameters,
+                                long methodCallCount, long basicBlockCount,
+                                long elapsedTimeMs, long timestamp) {
+            this.requestType = requestType;
+            this.parameters = Collections.unmodifiableMap(new HashMap<>(parameters));
+            this.methodCallCount = methodCallCount;
+            this.basicBlockCount = basicBlockCount;
+            this.elapsedTimeMs = elapsedTimeMs;
+            this.timestamp = timestamp;
+        }
+
+        public String getRequestType() { return requestType; }
+        public Map<String, String> getParameters() { return parameters; }
+        public long getMethodCallCount() { return methodCallCount; }
+        public long getBasicBlockCount() { return basicBlockCount; }
+        public long getElapsedTimeMs() { return elapsedTimeMs; }
+        public long getTimestamp() { return timestamp; }
+
+        /**
+         * Returns a flat map representation suitable for DynamoDB or serialization.
+         * Parameter keys are prefixed with "param_" to avoid collisions with metric keys.
+         */
+        public Map<String, String> toMap() {
+            Map<String, String> map = new HashMap<>();
+            map.put("requestType", requestType);
+            map.put("methodCallCount", String.valueOf(methodCallCount));
+            map.put("basicBlockCount", String.valueOf(basicBlockCount));
+            map.put("elapsedTimeMs", String.valueOf(elapsedTimeMs));
+            map.put("timestamp", String.valueOf(timestamp));
+            for (Map.Entry<String, String> entry : parameters.entrySet()) {
+                map.put("param_" + entry.getKey(), entry.getValue());
+            }
+            return map;
+        }
+
+        @Override
+        public String toString() {
+            return String.format("[%s] params=%s, methods=%d, basicblocks=%d, time=%dms",
+                    requestType, parameters, methodCallCount, basicBlockCount, elapsedTimeMs);
+        }
+    }
+
+    /**
+     * Holds per-request metrics for the current thread (mutable accumulator).
+     * Reused across requests on the same thread via reset().
      */
     public static class RequestMetrics {
         private long methodCallCount = 0;
         private long basicBlockCount = 0;
         private long startTime = 0;
-        private String requestId = "";
+        private String requestType = "";
+        private Map<String, String> parameters = new HashMap<>();
 
-        public void reset(String requestId) {
-            this.requestId = requestId;
+        /**
+         * Resets all counters and parses the URI into requestType + parameters.
+         * Called at the start of each request.
+         *
+         * @param uri the full request URI, e.g. "/fractals?w=400&h=300&iterations=100"
+         */
+        public void reset(String uri) {
             this.methodCallCount = 0;
             this.basicBlockCount = 0;
             this.startTime = System.nanoTime();
+            parseUri(uri);
+        }
+
+        private void parseUri(String uri) {
+            this.parameters = new HashMap<>();
+            if (uri == null || uri.isEmpty()) {
+                this.requestType = "unknown";
+                return;
+            }
+
+            // Split path and query: "/fractals?w=400&h=300"
+            int queryStart = uri.indexOf('?');
+            String path = queryStart >= 0 ? uri.substring(0, queryStart) : uri;
+            String query = queryStart >= 0 ? uri.substring(queryStart + 1) : null;
+
+            // Extract request type from path (remove leading /)
+            this.requestType = path.startsWith("/") ? path.substring(1) : path;
+            if (this.requestType.isEmpty()) {
+                this.requestType = "root";
+            }
+
+            // Parse query parameters
+            if (query != null && !query.isEmpty()) {
+                for (String param : query.split("&")) {
+                    String[] kv = param.split("=", 2);
+                    if (kv.length == 2) {
+                        this.parameters.put(kv[0], kv[1]);
+                    } else if (kv.length == 1) {
+                        this.parameters.put(kv[0], "");
+                    }
+                }
+            }
         }
 
         public long getMethodCallCount() { return methodCallCount; }
         public long getBasicBlockCount() { return basicBlockCount; }
-        public String getRequestId() { return requestId; }
+        public String getRequestType() { return requestType; }
+        public Map<String, String> getParameters() { return parameters; }
         public long getElapsedTimeMs() { return (System.nanoTime() - startTime) / 1_000_000; }
+
+        /**
+         * Creates an immutable snapshot of the current metrics.
+         */
+        public CompletedRequest snapshot() {
+            return new CompletedRequest(
+                    requestType,
+                    parameters,
+                    methodCallCount,
+                    basicBlockCount,
+                    getElapsedTimeMs(),
+                    System.currentTimeMillis()
+            );
+        }
 
         @Override
         public String toString() {
-            return String.format("[%s] methods=%d, basicblocks=%d, time=%dms",
-                    requestId, methodCallCount, basicBlockCount, getElapsedTimeMs());
+            return String.format("[%s] params=%s, methods=%d, basicblocks=%d, time=%dms",
+                    requestType, parameters, methodCallCount, basicBlockCount, getElapsedTimeMs());
         }
     }
 
@@ -41,15 +155,15 @@ public class MetricRegistry {
             ThreadLocal.withInitial(RequestMetrics::new);
 
     /**
-     * Storage for completed request metrics (requestId -> metrics snapshot).
+     * Storage for completed request metrics (bounded, newest first).
      */
-    private static final ConcurrentHashMap<String, String> completedMetrics = new ConcurrentHashMap<>();
+    private static final ConcurrentLinkedDeque<CompletedRequest> completedMetrics = new ConcurrentLinkedDeque<>();
 
     /**
      * Called at the start of request handling (e.g., handle() method entry).
      */
-    public static void startRequest(String requestId) {
-        threadMetrics.get().reset(requestId);
+    public static void startRequest(String uri) {
+        threadMetrics.get().reset(uri);
     }
 
     /**
@@ -67,13 +181,19 @@ public class MetricRegistry {
     }
 
     /**
-     * Called at the end of request handling. Logs and stores the metrics.
+     * Called at the end of request handling. Logs and stores the metrics snapshot.
      */
     public static void stopRequest() {
         RequestMetrics m = threadMetrics.get();
-        String summary = m.toString();
-        System.out.println("[Metrics] " + summary);
-        completedMetrics.put(m.getRequestId(), summary);
+        CompletedRequest snapshot = m.snapshot();
+        System.out.println("[Metrics] " + snapshot);
+
+        completedMetrics.addFirst(snapshot);
+
+        // Trim to bounded size to prevent unbounded memory growth.
+        while (completedMetrics.size() > MAX_COMPLETED_METRICS) {
+            completedMetrics.pollLast();
+        }
     }
 
     /**
@@ -84,9 +204,29 @@ public class MetricRegistry {
     }
 
     /**
-     * Returns all completed metrics.
+     * Returns all completed metrics as a list (newest first).
      */
-    public static Map<String, String> getCompletedMetrics() {
-        return completedMetrics;
+    public static List<CompletedRequest> getCompletedMetrics() {
+        return new ArrayList<>(completedMetrics);
+    }
+
+    /**
+     * Returns completed metrics filtered by request type (e.g., "fractals", "dna", "grayscott").
+     */
+    public static List<CompletedRequest> getCompletedMetricsByType(String requestType) {
+        List<CompletedRequest> filtered = new ArrayList<>();
+        for (CompletedRequest cr : completedMetrics) {
+            if (cr.getRequestType().equals(requestType)) {
+                filtered.add(cr);
+            }
+        }
+        return filtered;
+    }
+
+    /**
+     * Clears all completed metrics.
+     */
+    public static void clearCompletedMetrics() {
+        completedMetrics.clear();
     }
 }
