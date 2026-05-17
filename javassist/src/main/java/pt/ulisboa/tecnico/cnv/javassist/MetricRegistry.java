@@ -182,18 +182,21 @@ public class MetricRegistry {
 
     /**
      * Called at the end of request handling. Logs and stores the metrics snapshot.
+     * Also persists to DynamoDB asynchronously (if available).
      */
     public static void stopRequest() {
         RequestMetrics m = threadMetrics.get();
         CompletedRequest snapshot = m.snapshot();
         System.out.println("[Metrics] " + snapshot);
 
+        // Store locally (in-memory, bounded).
         completedMetrics.addFirst(snapshot);
-
-        // Trim to bounded size to prevent unbounded memory growth.
         while (completedMetrics.size() > MAX_COMPLETED_METRICS) {
             completedMetrics.pollLast();
         }
+
+        // Persist to DynamoDB (async, no-op if unavailable).
+        MetricsStorageService.getInstance().storeAsync(snapshot);
     }
 
     /**
