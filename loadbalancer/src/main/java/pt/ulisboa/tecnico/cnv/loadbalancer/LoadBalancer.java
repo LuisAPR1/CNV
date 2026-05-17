@@ -12,6 +12,8 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.Executors;
 
 /**
@@ -31,10 +33,12 @@ public class LoadBalancer {
 
     private final WorkerPool workerPool;
     private final AutoScaler autoScaler;
+    private final ComplexityEstimator complexityEstimator;
 
     public LoadBalancer(WorkerPool workerPool) {
         this.workerPool = workerPool;
         this.autoScaler = new AutoScaler(workerPool);
+        this.complexityEstimator = new ComplexityEstimator();
     }
 
     public void start(int port) throws IOException {
@@ -82,6 +86,12 @@ public class LoadBalancer {
                 os.close();
                 return;
             }
+
+            // Estimate request complexity before forwarding.
+            String requestType = path.substring(1); // remove leading /
+            Map<String, String> params = parseQuery(query);
+            ComplexityEstimator.Estimate estimate = complexityEstimator.estimate(requestType, params);
+            System.out.println("[LoadBalancer] Complexity estimate for " + path + ": " + estimate);
 
             // Try forwarding with retry on failure.
             int maxRetries = Math.min(3, workerPool.size());
@@ -136,6 +146,20 @@ public class LoadBalancer {
             if (!success) {
                 sendError(exchange, 502, "All workers unreachable after " + maxRetries + " attempts");
             }
+        }
+
+        private Map<String, String> parseQuery(String query) {
+            Map<String, String> result = new HashMap<>();
+            if (query == null || query.isEmpty()) return result;
+            for (String param : query.split("&")) {
+                String[] kv = param.split("=", 2);
+                if (kv.length == 2) {
+                    result.put(kv[0], kv[1]);
+                } else if (kv.length == 1) {
+                    result.put(kv[0], "");
+                }
+            }
+            return result;
         }
 
         private void sendError(HttpExchange exchange, int code, String message) throws IOException {
