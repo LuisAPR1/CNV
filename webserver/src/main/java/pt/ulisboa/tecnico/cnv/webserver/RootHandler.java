@@ -28,6 +28,6 @@ public class RootHandler implements HttpHandler {
             query = HELLO_MSG;
         System.out.println(query);
 
-        he.sendResponseHeaders(200, 0);
+        he.sendResponseHeaders(200, -1);
     }
 }

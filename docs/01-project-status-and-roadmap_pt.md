@@ -1,8 +1,28 @@
 # Nature@Cloud - Estado do Projeto & Roteiro
 
-> **Última atualização:** 2025-05-17  
-> **Autores:** Luis Alexandre + a81430  
+> **Última atualização:** 2025-05-17 (sessão noite — integração AWS)
+> **Autores:** Luis Alexandre + a81430 + laura
 > **Curso:** Computação e Virtualização na Nuvem (CNV) - IST 2025-26
+
+## Resumo desta sessão (laura)
+
+- Commits 1.1–1.3 do colega merged: `MetricRegistry` estruturado, `MetricsStorageService` (DynamoDB async), `ComplexityEstimator` no LB.
+- **AWS account model decidido:** conta própria do grupo, **NÃO Learner Lab**. Cada membro vai ter IAM user próprio.
+- **Infra-as-code criado:** pasta `scripts/` com 6 scripts bash (`.sh`, portáveis Linux/Mac/Git Bash) — IAM, network, AMI worker, launch worker, launch LB, cleanup. Seguem a estrutura do §9.2.1 deste documento.
+- **`.gitignore` reforçado** para impedir leak de chaves `.pem` e credenciais.
+- **`AutoScaler` reimplementado** com chamadas reais ao EC2 SDK (`runInstances`, `terminateInstances`, `describeInstances`), drenagem em scale-down, cooldown de 60s, cap de 5 workers. Degrada graciosamente para modo local-only quando `cnv.ami.id`/`cnv.worker.sg.id` não estão definidos.
+- **`AwsConfig`** centraliza configuração lida de system properties.
+- **`WorkerPool`** ganha: (a) `Worker.instanceId` opcional, (b) **health checks periódicos** a cada 15 s com remoção após 3 falhas consecutivas — fecha a Fase 2.3.
+- **Tabela DynamoDB:** criação automática pelo `MetricsStorageService` (sem script dedicado).
+
+Documentos novos:
+- `docs/02-fase2-aws-deployment.md` — detalhe da Fase 2 (este ficheiro).
+- `docs/03-aws-onboarding-guide.md` — checklist de tarefas AWS por membro do grupo.
+- `docs/04-testing-checklist.md` — guião de validação end-to-end (níveis 0–11).
+
+**Status global:** Fase 2 do roadmap (AWS Deployment) **fechada no código**. Falta validação em AWS real seguindo o `04-testing-checklist.md`.
+
+---
 
 ---
 
@@ -151,19 +171,28 @@ Conforme definido no `Project.txt`, o sistema tem **4 componentes principais**:
 
 ## 4. Estado Atual - O Que Temos
 
-### A funcionar localmente
+### Validado em AWS (Fase 2 completa)
 
 | Componente | Estado | Notas |
 |---|---|---|
-| **WebServer (workers)** | **A funcionar** | Executa em porta configurável, serve todos os 3 endpoints, multi-threaded (CachedThreadPool) |
-| **Agente Javassist** | **A funcionar** | Instrumenta no momento do carregamento; regista chamadas de métodos + BBs estimados + tempo por pedido no stdout |
-| **MetricRegistry** | **A funcionar** | Métricas thread-local, armazenamento concorrente de métricas concluídas |
-| **Balanceador de Carga** | **Parcialmente funcional** | Encaminha pedidos, encaminhamento least-loaded, retry com exclusão |
-| **AutoScaler** | **Apenas esqueleto** | Regista carga média a cada 10s, limiares definidos mas nenhuma ação tomada |
-| **Workers Lambda** | **Não iniciado** | Interfaces de handler existem (fornecidas pelo professor) mas sem deployment Lambda |
-| **DynamoDB (MSS)** | **Não iniciado** | Nenhum código existe |
-| **Deployment AWS** | **Não iniciado** | Sem scripts, sem AMI, sem security groups, sem automação de deployment |
-| **Estimativa de complexidade** | **Não iniciado** | O LB não utiliza parâmetros do pedido para estimar custo |
+| **WebServer (workers)** | **Validado em AWS** | Multi-threaded (CachedThreadPool), serve fractals/grayscott/dna; corre como systemd `cnv-worker.service` na AMI pré-cozida |
+| **Agente Javassist** | **Validado em AWS** | Instrumenta `pt.ulisboa.tecnico.cnv.{fractals,grayscott,dna}.*` no load time; conta method calls + BBs estimados + elapsed time |
+| **MetricRegistry** | **Validado em AWS** | `CompletedRequest` estruturado, ThreadLocal por pedido, ConcurrentLinkedDeque para histórico in-memory |
+| **MetricsStorageService (DynamoDB)** | **Validado em AWS** | Singleton + escritas assíncronas; auto-cria `cnv-metrics` (PAY_PER_REQUEST) com fix de race condition para scale-up; valida via IMDSv2 |
+| **Balanceador de Carga** | **Validado em AWS** | Least-loaded routing, retry com exclusão, complexity estimate no path; corre via `nohup` em EC2 dedicada |
+| **AutoScaler** | **Validado em AWS** | Scheduler 5s, threshold 1.0/0.25, cooldown 60s, cap 5 workers; lança/termina EC2 via SDK; **scale-up duplo real: 1→3 workers** com 20 pedidos `2000×2000×2000` |
+| **ComplexityEstimator** | **Validado em AWS** | Ratio-based usando histórico DynamoDB (cache 30s) + heuristic fallback; valor escala com `w*h*iter` |
+| **Health checks (WorkerPool)** | **Validado em AWS** | Pings cada 15s a `/`; remove worker após 3 falhas consecutivas; recover automático |
+| **Deployment AWS** | **Validado end-to-end** | 6 scripts bash idempotentes em `scripts/`, AMI worker pré-cozida (Java + JARs + systemd), IAM Roles + Instance Profiles + inline `iam:PassRole` |
+
+### Pendente (Fase 3+)
+
+| Componente | Estado | Notas |
+|---|---|---|
+| **Workers Lambda** | **Não iniciado** | Interfaces de handler existem; falta deployment de 3 Lambdas |
+| **Routing por complexidade** | **Parcial** | `Estimate` calculado mas LB ainda não o usa na escolha; só least-loaded |
+| **Lambda vs EC2 routing** | **Não iniciado** | Decisão custo/latência por pedido |
+| **Instrumentação real de BBs** | **Limitação conhecida** | Heurística `bytecodeLength/15` aplicada por entrada de método — `basicBlockCount` fica flat quando loops são intra-método (e.g. `JuliaFractal.generate`). Ver secção 5.2 A |
 
 ### Estrutura do projeto
 
@@ -173,7 +202,7 @@ CNV/
 ├── Project.txt              (enunciado do trabalho)
 ├── README.md                (instruções básicas)
 ├── docs/                    (esta pasta - para acompanhar o progresso)
-├── scripts/                 (vazia - deve conter automação AWS)
+├── scripts/                 (6 scripts bash: 01–iam, 02–network, 03–ami, 04–worker, 05–lb, 99–cleanup + aws-config.sh)
 ├── javassist/               (módulo do agente Javassist)
 │   ├── pom.xml
 │   └── src/.../javassist/
@@ -254,13 +283,13 @@ O LB precisa da capacidade de invocar funções Lambda como alternativa ao encam
 
 | # | Requisito | Estado |
 |---|---|---|
-| 1 | Workers VM multi-threaded | **FEITO** |
-| 2 | Instrumentação Javassist a recolher métricas | **FEITO** (com ressalvas na precisão dos BB) |
-| 3 | Deploy no AWS EC2 (t3.micro) | **NÃO FEITO** |
-| 4 | LB configurado na AWS a funcionar | **NÃO FEITO** (LB local existe mas sem integração AWS) |
-| 5 | AS configurado na AWS a funcionar | **NÃO FEITO** (apenas esqueleto, sem chamadas à API EC2) |
-| 6 | Lógica inicial LB/AS ou pseudocódigo | **PARCIALMENTE FEITO** (código existe mas sem estimativa de complexidade) |
-| 7 | DynamoDB MSS para métricas | **NÃO FEITO** |
+| 1 | Workers VM multi-threaded | **FEITO** (validado em AWS) |
+| 2 | Instrumentação Javassist a recolher métricas | **FEITO** (com limitação conhecida na contagem de BBs — ver 5.2 A) |
+| 3 | Deploy no AWS EC2 (t3.micro) | **FEITO** (`./04-launch-worker.sh` + AMI pré-cozida com systemd) |
+| 4 | LB configurado na AWS a funcionar | **FEITO** (`./05-launch-lb.sh`, validado com fractais 1000×1000) |
+| 5 | AS configurado na AWS a funcionar | **FEITO** (scale-up duplo real: 1→3 workers com 20 pedidos `2000×2000×2000`) |
+| 6 | Lógica inicial LB/AS ou pseudocódigo | **FEITO** (`ComplexityEstimator` ratio-based + heuristic fallback) |
+| 7 | DynamoDB MSS para métricas | **FEITO** (`MetricsStorageService`, tabela `cnv-metrics` auto-criada, 24+ records gravados) |
 | 8 | Relatório intermédio de 1 página | **NÃO FEITO** |
 | 9 | Vídeo de demonstração | **NÃO FEITO** |
 
@@ -284,12 +313,12 @@ O LB precisa da capacidade de invocar funções Lambda como alternativa ao encam
 - [x] Workers VM multi-threaded (`Executors.newCachedThreadPool()`)
 - [x] Agente Javassist carrega e instrumenta classes de carga de trabalho
 - [x] Métricas recolhidas: chamadas de métodos, blocos básicos estimados, tempo decorrido
-- [ ] Workers enviam métricas para o DynamoDB após cada pedido
-- [ ] LB executa no AWS EC2 (t3.micro)
-- [ ] Worker(s) executa(m) no AWS EC2 (t3.micro)
-- [ ] AutoScaler pode lançar/terminar instâncias EC2
-- [ ] LB tem lógica inicial de estimativa de complexidade (pelo menos pseudocódigo)
-- [ ] Scripts/automação de deployment em `scripts/`
+- [x] Workers enviam métricas para o DynamoDB após cada pedido (`MetricsStorageService.storeAsync`)
+- [x] LB executa no AWS EC2 (t3.micro)
+- [x] Worker(s) executa(m) no AWS EC2 (t3.micro)
+- [x] AutoScaler lança/termina instâncias EC2 (validado: scale-up duplo 1→3 workers, `[AutoScaler] SCALE UP (avgLoad=20.0 > 1.0)`)
+- [x] LB tem estimativa de complexidade (`ComplexityEstimator` ratio-based + heuristic fallback)
+- [x] Scripts/automação de deployment em `scripts/` (6 scripts bash idempotentes)
 - [ ] Relatório intermédio de 1 página
 - [ ] Vídeo de demonstração
 
@@ -435,6 +464,77 @@ Em `scripts/`, criar:
 
 ---
 
+## Apêndice: Setup AWS (passo a passo do grupo)
+
+### Modelo de conta
+- **Uma conta AWS** partilhada pelo grupo (criada pelo delegado).
+- **Vários IAM users** (um por membro) — ninguém usa a conta root.
+- Todos usam a mesma **região** (default no projecto: `eu-west-1`).
+
+### Setup inicial (cada membro, uma vez)
+1. Instalar AWS CLI v2: `msiexec.exe /i https://awscli.amazonaws.com/AWSCLIV2.msi`
+2. O delegado cria-te um IAM user e dá-te a Access Key + Secret.
+3. Correr `aws configure` com a tua chave, região `eu-west-1`, output `json`.
+4. Validar: `aws sts get-caller-identity` deve devolver o teu ARN.
+
+### Provisionamento da infra (uma vez por conta, idempotente)
+```bash
+cd scripts
+./01-setup-iam.sh        # 3 IAM Roles + 2 Instance Profiles
+./02-setup-network.sh    # 2 SGs + key pair (gera cnv-keypair.pem)
+
+cd .. && mvn clean package -DskipTests && cd scripts
+./03-create-ami.sh       # AMI worker pré-cozida (Java + JARs + systemd auto-start)
+```
+
+### Workflow de cada sessão
+```bash
+cd scripts
+./04-launch-worker.sh    # 1 worker a partir da AMI (auto-arranca via systemd)
+./05-launch-lb.sh        # LB arranca + AutoScaler já sabe usar a AMI worker
+# ... testar com curl ...
+./99-cleanup.sh          # IMPORTANTE: termina EC2s para não gastar Free Tier
+./99-cleanup.sh --deep   # No fim do projecto: apaga SGs/IAM/AMI/DynamoDB
+```
+
+### IAM Roles criadas
+| Role | Trusted entity | Policies |
+|---|---|---|
+| `CNV-LoadBalancer-Role` | `ec2.amazonaws.com` | EC2 + DynamoDB + Lambda + Logs |
+| `CNV-Worker-Role` | `ec2.amazonaws.com` | DynamoDB + Logs |
+| `CNV-Lambda-ExecutionRole` | `lambda.amazonaws.com` | LambdaBasicExecution + DynamoDB |
+
+### Configuração de runtime do LB na cloud (passada como `-D` system properties)
+- `-Daws.region=eu-west-1`
+- `-Dcnv.ami.id=<AMI dos workers>`
+- `-Dcnv.worker.sg.id=<SG id do worker, ver scripts/.state/worker-sg-id.txt>`
+- `-Dcnv.keypair.name=cnv-keypair`
+- `-Dcnv.worker.instance.profile=CNV-Worker-Role`
+
+Se estes não forem definidos, o AutoScaler entra em **local mode** e só faz logs (útil para desenvolver no PC sem custos AWS).
+
+### Permissão `iam:PassRole` (importante)
+
+O LB usa `--iam-instance-profile` para lançar workers via `runInstances`. A AWS exige que o caller tenha **`iam:PassRole`** para a role passada. A `AmazonEC2FullAccess` (que o LB tem) **não** inclui isso por design (princípio do menor privilégio).
+
+O `01-setup-iam.sh` adiciona uma inline policy `CNV-AllowPassWorkerRole` ao `CNV-LoadBalancer-Role`:
+```json
+{"Action": "iam:PassRole", "Resource": "arn:aws:iam::<ACCT>:role/CNV-Worker-Role"}
+```
+
+Se o AutoScaler logar `is not authorized to perform: iam:PassRole`, re-corre `./01-setup-iam.sh` e reinicia o LB (para o STS token apanhar a nova permissão).
+
+### Validação (Níveis 1–7 — ver `scripts/README.md`)
+1. `aws sts get-caller-identity` — credenciais
+2. `aws ec2 describe-regions` — permissões EC2
+3. Programa Java a chamar `AmazonEC2ClientBuilder.standard().build()` — SDK lê credenciais
+4. `aws dynamodb list-tables --region eu-west-1` — DynamoDB acessível (a tabela `cnv-metrics` é criada lazy pelo `MetricsStorageService` no primeiro pedido a um worker)
+5. `./04-launch-worker.sh` + `curl http://<ip>:8000/fractals?w=200&h=200&iterations=100` — EC2 + SG funcionam
+6. Dentro da EC2: `aws sts get-caller-identity --region eu-west-1` (Arn termina em `assumed-role/CNV-Worker-Role/i-...`) — instance profile entrega credenciais via IMDSv2
+7. LB + worker + `aws dynamodb scan` mostra métrica nova — integração end-to-end
+
+---
+
 ## Apêndice: Referência de Ficheiros Chave
 
 | Ficheiro | Propósito |
@@ -444,7 +544,11 @@ Em `scripts/`, criar:
 | `webserver/WebServer.java` | Servidor HTTP worker (executa no EC2 com `-javaagent`) |
 | `loadbalancer/LoadBalancer.java` | Ponto de entrada LB, encaminha para workers |
 | `loadbalancer/WorkerPool.java` | Gestão do pool de workers, estratégias de seleção |
-| `loadbalancer/AutoScaler.java` | (Esqueleto) Monitoriza carga, decide aumentar/diminuir |
+| `loadbalancer/AutoScaler.java` | Monitoriza carga e lança/termina EC2s via SDK (degrada para local-only sem config) |
+| `loadbalancer/AwsConfig.java` | Configuração AWS centralizada (region, AMI, SG, keypair, instance profile) |
+| `loadbalancer/ComplexityEstimator.java` | Estima cost de pedidos (histórico DynamoDB + fallback heurístico, cache 30s) |
+| `javassist/MetricsStorageService.java` | Persistência assíncrona de métricas no DynamoDB |
+| `scripts/*.sh` | Provisionamento e cleanup de toda a infra AWS (01–iam, 02–network, 03–ami, 04–worker, 05–lb, 99–cleanup) |
 | `fractals/FractalsHandler.java` | Handler de carga de trabalho fractal (fornecido pelo professor) |
 | `grayscott/GrayScottHandler.java` | Handler de carga de trabalho GrayScott (fornecido pelo professor) |
 | `dna/DnaHandler.java` | Handler de correspondência de ADN (fornecido pelo professor) |

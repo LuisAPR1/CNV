@@ -9,6 +9,7 @@ import com.amazonaws.services.dynamodbv2.model.CreateTableRequest;
 import com.amazonaws.services.dynamodbv2.model.KeySchemaElement;
 import com.amazonaws.services.dynamodbv2.model.KeyType;
 import com.amazonaws.services.dynamodbv2.model.PutItemRequest;
+import com.amazonaws.services.dynamodbv2.model.ResourceInUseException;
 import com.amazonaws.services.dynamodbv2.model.ResourceNotFoundException;
 import com.amazonaws.services.dynamodbv2.model.ScalarAttributeType;
 
@@ -140,7 +141,12 @@ public class MetricsStorageService {
                             new AttributeDefinition(SORT_KEY, ScalarAttributeType.S))
                     .withBillingMode(BillingMode.PAY_PER_REQUEST);
 
-            dynamoDB.createTable(req);
+            try {
+                dynamoDB.createTable(req);
+            } catch (ResourceInUseException raceWinner) {
+                // Outro worker em paralelo já lançou createTable — não é erro.
+                System.out.println("[MetricsStorage] Tabela a ser criada por outro processo — a aguardar.");
+            }
 
             // Esperar até a tabela ficar ACTIVE (máximo ~30s).
             waitForTableActive();

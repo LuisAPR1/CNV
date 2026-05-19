@@ -50,8 +50,9 @@ public class LoadBalancer {
         System.out.println("[LoadBalancer] Listening on port " + port);
         System.out.println("[LoadBalancer] Workers: " + workerPool.size());
 
-        // Start auto scaler in background.
+        // Start auto scaler + worker health checks in background.
         autoScaler.start();
+        workerPool.startHealthChecks();
     }
 
     /**
