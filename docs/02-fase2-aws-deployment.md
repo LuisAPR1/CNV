@@ -106,7 +106,8 @@ RUNTIME (cada sessão):
         │                  └─► AutoScaler usa runInstances/terminate (com Worker-Role)
         │
 TESTE:
-  curl http://<lb_ip>:8080/fractals?w=400&h=300&iterations=100 ──► imagem PNG
+  curl http://<lb_ip>:8080/fractals?... ──► data URL "data:image/png;base64,<b64>"
+                                          (pipe via base64 -d para obter PNG)
         │
 CLEANUP:
   99-cleanup.sh        ──► termina EC2s

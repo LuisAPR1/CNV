@@ -25,20 +25,36 @@ public class WorkerPool {
         private final int port;
         private final String instanceId; // null quando o worker é local/manual
         private final AtomicInteger activeRequests = new AtomicInteger(0);
+        private final long graceUntilMs; // 0 = sem grace period
 
         public Worker(String host, int port) {
-            this(host, port, null);
+            this(host, port, null, 0L);
         }
 
         public Worker(String host, int port, String instanceId) {
+            this(host, port, instanceId, 0L);
+        }
+
+        public Worker(String host, int port, String instanceId, long graceMs) {
             this.host = host;
             this.port = port;
             this.instanceId = instanceId;
+            this.graceUntilMs = graceMs > 0L ? System.currentTimeMillis() + graceMs : 0L;
         }
 
         public String getHost() { return host; }
         public int getPort() { return port; }
         public String getInstanceId() { return instanceId; }
+
+        /**
+         * Indica se o worker ainda está no período de grace inicial (a aguardar
+         * bootstrap do systemd cnv-worker.service). O health checker deve
+         * ignorar workers em grace para evitar removê-los antes de estarem
+         * prontos a servir pedidos.
+         */
+        public boolean isInGracePeriod() {
+            return graceUntilMs > 0L && System.currentTimeMillis() < graceUntilMs;
+        }
 
         public String getBaseUrl() {
             return "http://" + host + ":" + port;
@@ -93,13 +109,24 @@ public class WorkerPool {
     private ScheduledExecutorService healthChecker;
 
     public void addWorker(String host, int port) {
-        addWorker(host, port, null);
+        addWorker(host, port, null, 0L);
     }
 
     public Worker addWorker(String host, int port, String instanceId) {
-        Worker w = new Worker(host, port, instanceId);
+        return addWorker(host, port, instanceId, 0L);
+    }
+
+    /**
+     * Adiciona um worker com um período de grace inicial (em ms). Durante
+     * esse período, o health checker não conta falhas — útil para evitar
+     * que um worker EC2 recém-lançado seja removido enquanto o systemd
+     * ainda está a arrancar o serviço HTTP.
+     */
+    public Worker addWorker(String host, int port, String instanceId, long graceMs) {
+        Worker w = new Worker(host, port, instanceId, graceMs);
         workers.add(w);
-        System.out.println("[WorkerPool] Added worker: " + w);
+        String graceInfo = graceMs > 0L ? " (grace=" + (graceMs / 1000) + "s)" : "";
+        System.out.println("[WorkerPool] Added worker: " + w + graceInfo);
         return w;
     }
 
@@ -177,6 +204,10 @@ public class WorkerPool {
         // Snapshot to avoid surprises if workers are mutated mid-iteration.
         for (Worker w : workers) {
             try {
+                if (w.isInGracePeriod()) {
+                    // Worker ainda a arrancar (systemd cnv-worker). Não contar falhas.
+                    continue;
+                }
                 if (w.isHealthy()) {
                     if (consecutiveFailures.remove(w) != null) {
                         System.out.println("[WorkerPool] Health recovered: " + w);

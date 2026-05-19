@@ -38,9 +38,10 @@ cd scripts
 ./04-launch-worker.sh    # Lança 1 worker
 ./05-launch-lb.sh $(head -1 .state/worker-instance-ids.txt)  # Lança LB
 
-# 4. Testar
+# 4. Testar (resposta e data URL "data:image/png;base64,<b64>" - decodificar)
 LB_IP=$(cat .state/lb-ip.txt)
-curl "http://$LB_IP:8080/fractals?w=400&h=300&iterations=100" --output test.png
+curl -s "http://$LB_IP:8080/fractals?w=400&h=300&iterations=100" \
+    | sed 's/^data:image\/png;base64,//' | base64 -d > test.png
 ```
 
 ---

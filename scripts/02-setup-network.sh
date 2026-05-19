@@ -32,13 +32,28 @@ VPC_ID=$(aws ec2 describe-vpcs --filters "Name=is-default,Values=true" \
 VPC_ID=$(sanitize "$VPC_ID")
 info "VPC default: $VPC_ID"
 
-MY_IP=$(curl -fsS https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]' || true)
-if [ -n "$MY_IP" ]; then
+# Permitir override manual via env var (útil em redes corporativas/CI):
+#   MY_IP=1.2.3.4 ./02-setup-network.sh           -> autoriza 1.2.3.4/32
+#   MY_CIDR=1.2.3.0/24 ./02-setup-network.sh      -> autoriza CIDR completo
+if [ -z "${MY_IP:-}" ]; then
+    MY_IP=$(curl -fsS https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]' || true)
+fi
+
+if [ -n "${MY_CIDR:-}" ]; then
+    info "MY_CIDR explícito: $MY_CIDR"
+elif [ -n "$MY_IP" ]; then
     MY_CIDR="$MY_IP/32"
-    info "O teu IP público: $MY_IP (autorizado para SSH)"
+    info "IP público detectado: $MY_IP (autorizado para SSH em $MY_CIDR)"
 else
-    warn "Não detectei o teu IP. SSH ficará aberto para 0.0.0.0/0 (não recomendado)."
-    MY_CIDR="0.0.0.0/0"
+    err "Não consegui detectar o teu IP público (checkip.amazonaws.com falhou)."
+    err ""
+    err "Define manualmente uma destas variáveis e re-corre:"
+    err "  MY_IP=1.2.3.4 ./02-setup-network.sh"
+    err "  MY_CIDR=1.2.3.0/24 ./02-setup-network.sh"
+    err ""
+    err "Abrir SSH para 0.0.0.0/0 é INSEGURO e foi desactivado deliberadamente."
+    err "Se realmente quiseres, força com: MY_CIDR=0.0.0.0/0 ./02-setup-network.sh"
+    exit 1
 fi
 
 ensure_sg() {

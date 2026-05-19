@@ -42,6 +42,9 @@ public class AutoScaler {
     private static final int MIN_WORKERS = 1;
     private static final int MAX_WORKERS = 5;
     private static final long COOLDOWN_MS = 60_000;
+    /** Grace period concedido a um worker recém-lançado: 90 s.
+     *  Cobre o tempo entre EC2 "running" e systemd cnv-worker a servir HTTP. */
+    private static final long WORKER_GRACE_MS = 90_000L;
 
     /**
      * User-data executado pela EC2 worker no primeiro boot.
@@ -178,10 +181,11 @@ public class AutoScaler {
                 return;
             }
 
-            workerPool.addWorker(publicIp, AwsConfig.WORKER_PORT, instanceId);
+            workerPool.addWorker(publicIp, AwsConfig.WORKER_PORT, instanceId, WORKER_GRACE_MS);
             lastScalingAction = System.currentTimeMillis();
             System.out.println("[AutoScaler] Worker " + instanceId + " @ " + publicIp + " adicionado ao pool.");
             System.out.println("[AutoScaler] systemd cnv-worker.service arrancará automaticamente (~30-60s para servir pedidos).");
+            System.out.println("[AutoScaler] Health checks ignorados durante grace de " + (WORKER_GRACE_MS / 1000) + "s.");
         } catch (Exception e) {
             System.err.println("[AutoScaler] Falha no SCALE UP: " + e.getMessage());
         }
@@ -271,7 +275,9 @@ public class AutoScaler {
             for (Instance inst : r.getInstances()) {
                 String ip = inst.getPublicIpAddress();
                 if (ip != null) {
-                    workerPool.addWorker(ip, AwsConfig.WORKER_PORT, inst.getInstanceId());
+                    // Grace curto: a instância já está "running" há algum tempo,
+                    // mas damos margem para a primeira health check confirmar.
+                    workerPool.addWorker(ip, AwsConfig.WORKER_PORT, inst.getInstanceId(), 30_000L);
                 }
             }
         }
