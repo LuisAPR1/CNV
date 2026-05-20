@@ -71,6 +71,7 @@ LB_IP=$(aws ec2 describe-instances --instance-ids "$LB_INSTANCE_ID" --region "$A
     --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
 LB_IP=$(sanitize "$LB_IP")
 printf '%s' "$LB_INSTANCE_ID" > "$LB_INSTANCE_ID_FILE"
+printf '%s' "$LB_IP" > "$STATE_DIR/lb-ip.txt"
 
 info "A aguardar SSH + Java instalado (~60s)..."
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -i "$KEYPAIR_FILE")

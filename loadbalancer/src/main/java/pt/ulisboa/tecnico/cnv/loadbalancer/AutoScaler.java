@@ -68,6 +68,30 @@ public class AutoScaler {
     public AutoScaler(WorkerPool workerPool) {
         this.workerPool = workerPool;
         this.awsMode = initAwsClient();
+        // Registar callback: quando um worker falhar health checks e for evicto pelo
+        // WorkerPool, terminar a EC2 (se for gerida) para evitar instâncias órfãs.
+        workerPool.setOnUnhealthyEviction(this::handleUnhealthyEviction);
+    }
+
+    /**
+     * Chamado pelo {@link WorkerPool} quando um worker é evicto por health-check
+     * (3 falhas consecutivas). Se a instância foi lançada pelo AutoScaler
+     * (tem {@code instanceId}), tenta terminá-la na AWS para libertar recursos.
+     */
+    private void handleUnhealthyEviction(WorkerPool.Worker w) {
+        if (!awsMode || w.getInstanceId() == null) {
+            System.out.println("[AutoScaler] Eviction de worker manual/local — não há EC2 a terminar: " + w);
+            return;
+        }
+        try {
+            ec2.terminateInstances(new TerminateInstancesRequest()
+                    .withInstanceIds(w.getInstanceId()));
+            System.out.println("[AutoScaler] EC2 " + w.getInstanceId()
+                    + " terminada por health-check eviction.");
+        } catch (Exception e) {
+            System.err.println("[AutoScaler] Falha a terminar EC2 " + w.getInstanceId()
+                    + " após eviction: " + e.getMessage());
+        }
     }
 
     private boolean initAwsClient() {
@@ -93,6 +117,16 @@ public class AutoScaler {
     }
 
     public void start() {
+        // Em modo AWS, descobrir EC2s já a correr com tag Role=worker e adoptá-las
+        // no pool — evita criar workers órfãos quando o LB arranca a meio do dia,
+        // ou quando o operador lançou workers manualmente antes do LB.
+        if (awsMode) {
+            try {
+                discoverExistingWorkers();
+            } catch (Exception e) {
+                System.err.println("[AutoScaler] discoverExistingWorkers falhou: " + e.getMessage());
+            }
+        }
         scheduler.scheduleAtFixedRate(this::checkAndScale,
                 CHECK_INTERVAL_SECONDS, CHECK_INTERVAL_SECONDS, TimeUnit.SECONDS);
         System.out.println("[AutoScaler] Iniciado. Verificação a cada " + CHECK_INTERVAL_SECONDS + "s");
@@ -255,25 +289,31 @@ public class AutoScaler {
     }
 
     /**
-     * Inventário das EC2s já existentes na conta com o tag Role=worker
-     * — útil quando o LB arranca a meio do dia e precisa de descobrir
-     * workers já em execução. (Opcional, fica para iteração futura.)
+     * Inventário das EC2s já existentes na conta com tag Project=NatureAtCloud,
+     * Role=worker e estado running — adopta-as no {@link WorkerPool} para que
+     * passem a estar sob gestão do AutoScaler (incluindo scale-down).
+     *
+     * <p>O método é seguro contra duplicados graças à idempotência do
+     * {@link WorkerPool#addWorker(String, int, String)}.
      */
-    @SuppressWarnings("unused")
-    private void discoverExistingWorkers() {
+    public void discoverExistingWorkers() {
         if (!awsMode) return;
         DescribeInstancesResult res = ec2.describeInstances(new DescribeInstancesRequest()
                 .withFilters(
                         new com.amazonaws.services.ec2.model.Filter("tag:Project", Collections.singletonList("NatureAtCloud")),
                         new com.amazonaws.services.ec2.model.Filter("tag:Role", Collections.singletonList("worker")),
                         new com.amazonaws.services.ec2.model.Filter("instance-state-name", Collections.singletonList("running"))));
+        int discovered = 0;
         for (Reservation r : res.getReservations()) {
             for (Instance inst : r.getInstances()) {
                 String ip = inst.getPublicIpAddress();
                 if (ip != null) {
                     workerPool.addWorker(ip, AwsConfig.WORKER_PORT, inst.getInstanceId());
+                    discovered++;
                 }
             }
         }
+        System.out.println("[AutoScaler] discoverExistingWorkers: " + discovered
+                + " EC2(s) Role=worker running encontradas e adoptadas.");
     }
 }

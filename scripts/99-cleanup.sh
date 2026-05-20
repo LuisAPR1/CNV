@@ -28,7 +28,7 @@ else
     aws ec2 wait instance-terminated --instance-ids $IDS --region "$AWS_REGION"
     ok "Instâncias terminadas."
 fi
-rm -f "$WORKER_INSTANCE_IDS_FILE" "$LB_INSTANCE_ID_FILE"
+rm -f "$WORKER_INSTANCE_IDS_FILE" "$LB_INSTANCE_ID_FILE" "$STATE_DIR/lb-ip.txt"
 
 if [ "$DEEP" != "true" ]; then
     ok "Cleanup superficial concluído. Infra (SG/KeyPair/IAM/Dynamo/AMI) preservada."
@@ -40,19 +40,27 @@ warn "DEEP CLEAN: vou apagar SGs, key pair, IAM roles, AMI worker e tabela Dynam
 read -r -p "Tens a certeza? (escreve YES) " CONFIRM
 if [ "$CONFIRM" != "YES" ]; then info "Cancelado."; exit 0; fi
 
-# --- 2) AMI worker + snapshots associados ---
-if [ -f "$WORKER_AMI_ID_FILE" ]; then
-    AMI_ID=$(read_state "$WORKER_AMI_ID_FILE")
+# --- 2) AMIs worker + snapshots associados ---
+# Apaga TODAS as AMIs deste owner cujo nome comece por "cnv-worker-ami-",
+# não apenas a registada em .state/. Isto evita acumulação de AMIs órfãs
+# quando 03-create-ami.sh é re-executado e gera uma nova AMI.
+info "A procurar AMIs do projecto (name=cnv-worker-ami-*)..."
+ALL_AMIS=$(aws ec2 describe-images --owners self --region "$AWS_REGION" \
+    --filters "Name=name,Values=cnv-worker-ami-*" \
+    --query "Images[].ImageId" --output text 2>/dev/null || true)
+for AMI_ID in $ALL_AMIS; do
+    [ -z "$AMI_ID" ] && continue
     SNAPS=$(aws ec2 describe-images --image-ids "$AMI_ID" --region "$AWS_REGION" \
         --query "Images[0].BlockDeviceMappings[].Ebs.SnapshotId" --output text 2>/dev/null || true)
     aws ec2 deregister-image --image-id "$AMI_ID" --region "$AWS_REGION" 2>/dev/null \
-        && ok "AMI $AMI_ID desregistada." || warn "Falha a desregistar AMI."
+        && ok "AMI $AMI_ID desregistada." || warn "Falha a desregistar AMI $AMI_ID."
     for s in $SNAPS; do
+        [ -z "$s" ] && continue
         aws ec2 delete-snapshot --snapshot-id "$s" --region "$AWS_REGION" 2>/dev/null \
             && ok "  snapshot $s apagado." || true
     done
-    rm -f "$WORKER_AMI_ID_FILE"
-fi
+done
+rm -f "$WORKER_AMI_ID_FILE"
 
 # --- 3) Security Groups ---
 for sg_name in "$WORKER_SG_NAME" "$LB_SG_NAME"; do

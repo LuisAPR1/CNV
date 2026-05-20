@@ -1,10 +1,42 @@
 # Nature@Cloud - Estado do Projeto & Roteiro
 
-> **Última atualização:** 2025-05-17 (sessão noite — integração AWS)
+> **Última atualização:** 2026-05-19 (sessão 2 — re-validação assistida + 4 fixes)
 > **Autores:** Luis Alexandre + a81430 + laura
 > **Curso:** Computação e Virtualização na Nuvem (CNV) - IST 2025-26
 
-## Resumo desta sessão (laura)
+## Resumo da sessão 2 (laura, 2026-05-19, validação assistida)
+
+Sessão de re-validação end-to-end com agente assistente. Resultado: **Fase 2 100% validada em AWS real** + **4 bugs adicionais corrigidos** que tinham passado desapercebidos.
+
+**Validações executadas (todas verdes ✅):**
+
+- Build local (`mvn package`) + 3 endpoints (`/fractals`, `/grayscott`, `/dna`) a responder com `data:image/png;base64,...` válido
+- SG SSH restrito a `/32` (sem `0.0.0.0/0`)
+- Scale-up triplo (1→5 workers) durante burst pesado
+- Scale-down 5→3 confirmado em logs do `AutoScaler` (`SCALE DOWN (avgLoad=0.0 < 0.25)`)
+- DynamoDB `cnv-metrics` com **467 items**, schema confirmado: `requestId, requestType, methodCallCount, basicBlockCount, elapsedTimeMs, timestamp, param_*`
+- `ComplexityEstimator` a usar histórico: `Cache atualizado para 'fractals': 50 registos`
+- Health-check eviction: `FAILED (1/3) → (2/3) → (3/3) → Removing unhealthy worker`
+- Cleanup `--deep` completo (0 EC2, 0 AMIs, 0 SGs, 0 IAM, 0 DynamoDB no final)
+
+**Bugs descobertos + fixes aplicados (ver detalhe em `docs/05-handoff-fase2.md`):**
+
+1. `WorkerPool.runHealthChecks` retirava worker do pool mas não terminava a EC2 → **orphans potenciais**. Fix: `WorkerPool.setOnUnhealthyEviction(Consumer)` registado pelo `AutoScaler`, que termina a EC2 quando há eviction.
+2. `LoadBalancer.main` adicionava `localhost:8000` em AWS mode quando arrancava sem args. Fix: detectar `AwsConfig.isAwsScalingEnabled()` e deixar pool vazio.
+3. `AutoScaler.start()` agora chama `discoverExistingWorkers()` para adoptar EC2s lançadas manualmente (com tag `Role=worker`) — antes ficavam fora do pool e nunca eram terminadas.
+4. `WorkerPool.addWorker` ganhou idempotência por `(host, port)` para evitar duplicados quando `discover` corre alongside dos args do CLI.
+
+**Bugs de infraestrutura corrigidos no mesmo passo:**
+
+- `05-launch-lb.sh` agora grava `scripts/.state/lb-ip.txt` (o runbook lia, mas nunca era criado).
+- `99-cleanup.sh --deep` apaga **todas** as AMIs `cnv-worker-ami-*` (antes só apagava a do `.state/`).
+- Runbook (`06-revalidation-runbook.md`) corrigido: referências a "grace period" inexistente removidas; schema da DynamoDB actualizado para os nomes reais.
+
+**Evidência:** logs preservados em `docs/evidence-2026-05-19-validation/` (4 ficheiros: scale-test, resilience-test, scaledown-watch, logs-collected).
+
+---
+
+## Resumo da sessão 1 (laura)
 
 - Commits 1.1–1.3 do colega merged: `MetricRegistry` estruturado, `MetricsStorageService` (DynamoDB async), `ComplexityEstimator` no LB.
 - **AWS account model decidido:** conta própria do grupo, **NÃO Learner Lab**. Cada membro vai ter IAM user próprio.

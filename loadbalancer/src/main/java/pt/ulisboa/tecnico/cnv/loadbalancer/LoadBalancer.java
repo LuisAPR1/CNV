@@ -189,8 +189,13 @@ public class LoadBalancer {
                 int workerPort = Integer.parseInt(parts[1]);
                 pool.addWorker(host, workerPort);
             }
+        } else if (AwsConfig.isAwsScalingEnabled()) {
+            // AWS mode sem args: pool arranca vazio. O AutoScaler vai descobrir
+            // workers existentes (discoverExistingWorkers) e/ou criar novos.
+            System.out.println("[LoadBalancer] AWS mode: pool inicial vazio. "
+                    + "AutoScaler vai descobrir/provisionar workers.");
         } else {
-            // Default: single local worker on port 8000.
+            // Local-dev fallback: 1 worker em localhost:8000.
             pool.addWorker("localhost", 8000);
         }
 

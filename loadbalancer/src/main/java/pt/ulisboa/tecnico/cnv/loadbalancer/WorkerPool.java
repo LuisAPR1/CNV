@@ -13,6 +13,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 
 /**
  * Manages a pool of worker instances and selects which worker handles each request.
@@ -92,11 +93,38 @@ public class WorkerPool {
     private final ConcurrentHashMap<Worker, Integer> consecutiveFailures = new ConcurrentHashMap<>();
     private ScheduledExecutorService healthChecker;
 
+    /**
+     * Callback invoked when a worker is evicted by the health-checker (i.e. failed
+     * {@value #FAILURES_BEFORE_REMOVAL} consecutive checks). The AutoScaler registers
+     * here to also terminate the corresponding EC2 instance, avoiding orphan
+     * instances when an app crashes but the VM is still running.
+     *
+     * <p>NOT invoked by {@link #removeWorker(Worker)} (which is the manual / scale-down
+     * path; the caller is responsible for any cleanup).
+     */
+    private volatile Consumer<Worker> onUnhealthyEviction;
+
+    public void setOnUnhealthyEviction(Consumer<Worker> callback) {
+        this.onUnhealthyEviction = callback;
+    }
+
     public void addWorker(String host, int port) {
         addWorker(host, port, null);
     }
 
+    /**
+     * Idempotent by (host, port): if a worker with the same endpoint is already in the
+     * pool, returns the existing entry instead of adding a duplicate. This is essential
+     * when {@code discoverExistingWorkers()} runs alongside explicit args on the LB
+     * command line.
+     */
     public Worker addWorker(String host, int port, String instanceId) {
+        for (Worker existing : workers) {
+            if (existing.getHost().equals(host) && existing.getPort() == port) {
+                System.out.println("[WorkerPool] Skip duplicate (already present): " + existing);
+                return existing;
+            }
+        }
         Worker w = new Worker(host, port, instanceId);
         workers.add(w);
         System.out.println("[WorkerPool] Added worker: " + w);
@@ -189,6 +217,15 @@ public class WorkerPool {
                         System.out.println("[WorkerPool] Removing unhealthy worker: " + w);
                         removeWorker(w);
                         consecutiveFailures.remove(w);
+                        Consumer<Worker> cb = onUnhealthyEviction;
+                        if (cb != null) {
+                            try {
+                                cb.accept(w);
+                            } catch (Exception cbErr) {
+                                System.err.println("[WorkerPool] Eviction callback failed for "
+                                        + w + ": " + cbErr.getMessage());
+                            }
+                        }
                     }
                 }
             } catch (Exception e) {
