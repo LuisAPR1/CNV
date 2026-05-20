@@ -258,13 +258,9 @@ WORKER_ID=$(cat .state/worker-instance-ids.txt | head -1)
 Aguarda ~30 s para o LB arrancar e testa:
 ```bash
 LB_IP=18.x.x.x
-# Nota: a resposta e uma data URL ("data:image/png;base64,<...>"), NAO bytes PNG.
-# Decodifica antes de gravar:
-curl -s "http://$LB_IP:8080/fractals?w=400&h=400&iterations=200" \
-    | sed 's/^data:image\/png;base64,//' | base64 -d > fractal2.png
-
-file fractal2.png
-# Esperado: fractal2.png: PNG image data, 400 x 400, ...
+curl "http://$LB_IP:8080/fractals?w=400&h=400&iterations=200" --output fractal2.png
+ls -la fractal2.png
+# Esperado: PNG > 0 bytes
 ```
 
 **Para ver os logs do LB (incluindo decisões do AutoScaler e ComplexityEstimator):**
@@ -289,9 +285,10 @@ Para ver o AutoScaler a lançar uma EC2 nova, manda **muitos pedidos
 concorrentes**:
 
 ```bash
-# 20 pedidos simultaneos (stress test - descartamos o output):
+# 20 pedidos simultâneos:
 for i in {1..20}; do
-    curl -s -o /dev/null "http://$LB_IP:8080/fractals?w=800&h=800&iterations=500" &
+    curl -s "http://$LB_IP:8080/fractals?w=800&h=800&iterations=500" \
+        --output "/tmp/f$i.png" &
 done
 wait
 ```
