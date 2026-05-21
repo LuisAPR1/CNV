@@ -28,20 +28,27 @@ import java.util.concurrent.TimeUnit;
  *      = false. Apenas regista decisões nos logs (útil para desenvolvimento local).
  *   2. <b>AWS mode</b>: lança/termina instâncias EC2 via SDK.
  *
- * Estratégia simples (calibrável):
- *   - Se avgLoad &gt; SCALE_UP_THRESHOLD durante 1 verificação consecutiva → +1 worker
- *   - Se avgLoad &lt; SCALE_DOWN_THRESHOLD e numWorkers &gt; MIN_WORKERS → -1 worker
+ * Estratégia (calibrável):
+ *   - Usa estimatedWork (soma dos custos estimados pelo ComplexityEstimator)
+ *     em vez de contagem bruta de pedidos ativos.
+ *   - Se avgEstimatedWork &gt; ESTIMATED_WORK_THRESHOLD → +1 worker
+ *   - Se avgEstimatedWork &lt; ESTIMATED_WORK_THRESHOLD / 4 e numWorkers &gt; MIN_WORKERS → -1 worker
  *   - Cooldown de 60s entre acções para evitar oscilação.
  *   - Cap de 5 workers para não explodir custos durante testes.
  */
 public class AutoScaler {
 
     private static final int CHECK_INTERVAL_SECONDS = 5;
-    private static final double SCALE_UP_THRESHOLD = 1.0;
-    private static final double SCALE_DOWN_THRESHOLD = 0.25;
     private static final int MIN_WORKERS = 1;
     private static final int MAX_WORKERS = 5;
     private static final long COOLDOWN_MS = 60_000;
+
+    /**
+     * Limiar de trabalho estimado por worker (em basic blocks).
+     * ~1 bilião BBs ≈ um pedido médio de fractals (800×800×500).
+     * Acima disto, o AutoScaler adiciona workers.
+     */
+    private static final long ESTIMATED_WORK_THRESHOLD = 1_000_000_000L;
 
     /**
      * User-data executado pela EC2 worker no primeiro boot.
@@ -139,15 +146,17 @@ public class AutoScaler {
     private void checkAndScale() {
         try {
             int numWorkers = workerPool.size();
+            long totalEstimatedWork = 0;
             int totalActive = 0;
             for (WorkerPool.Worker w : workerPool.getWorkers()) {
+                totalEstimatedWork += w.getEstimatedWork();
                 totalActive += w.getActiveRequests();
             }
-            double avgLoad = numWorkers == 0 ? Double.POSITIVE_INFINITY
-                    : (double) totalActive / numWorkers;
+            long avgEstimatedWork = numWorkers == 0 ? Long.MAX_VALUE
+                    : totalEstimatedWork / numWorkers;
 
-            System.out.printf("[AutoScaler] Workers=%d, TotalActive=%d, AvgLoad=%.2f%n",
-                    numWorkers, totalActive, avgLoad);
+            System.out.printf("[AutoScaler] Workers=%d, TotalActive=%d, TotalEstWork=%d, AvgEstWork=%d%n",
+                    numWorkers, totalActive, totalEstimatedWork, avgEstimatedWork);
 
             // Cooldown — não fazer scaling demasiado depressa.
             if (System.currentTimeMillis() - lastScalingAction < COOLDOWN_MS) {
@@ -157,11 +166,13 @@ public class AutoScaler {
             if (numWorkers < MIN_WORKERS) {
                 System.out.println("[AutoScaler] Abaixo do mínimo (" + MIN_WORKERS + ") — SCALE UP forçado.");
                 scaleUp();
-            } else if (avgLoad > SCALE_UP_THRESHOLD && numWorkers < MAX_WORKERS) {
-                System.out.println("[AutoScaler] SCALE UP (avgLoad=" + avgLoad + " > " + SCALE_UP_THRESHOLD + ")");
+            } else if (avgEstimatedWork > ESTIMATED_WORK_THRESHOLD && numWorkers < MAX_WORKERS) {
+                System.out.println("[AutoScaler] SCALE UP (avgEstWork=" + avgEstimatedWork
+                        + " > " + ESTIMATED_WORK_THRESHOLD + ")");
                 scaleUp();
-            } else if (avgLoad < SCALE_DOWN_THRESHOLD && numWorkers > MIN_WORKERS) {
-                System.out.println("[AutoScaler] SCALE DOWN (avgLoad=" + avgLoad + " < " + SCALE_DOWN_THRESHOLD + ")");
+            } else if (avgEstimatedWork < ESTIMATED_WORK_THRESHOLD / 4 && numWorkers > MIN_WORKERS) {
+                System.out.println("[AutoScaler] SCALE DOWN (avgEstWork=" + avgEstimatedWork
+                        + " < " + (ESTIMATED_WORK_THRESHOLD / 4) + ")");
                 scaleDown();
             }
         } catch (Exception e) {
@@ -255,7 +266,7 @@ public class AutoScaler {
         WorkerPool.Worker target = null;
         for (WorkerPool.Worker w : workerPool.getWorkers()) {
             if (w.getInstanceId() == null) continue; // não terminar workers manuais
-            if (target == null || w.getActiveRequests() < target.getActiveRequests()) {
+            if (target == null || w.getEstimatedWork() < target.getEstimatedWork()) {
                 target = w;
             }
         }

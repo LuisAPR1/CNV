@@ -13,6 +13,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
 /**
@@ -26,6 +27,7 @@ public class WorkerPool {
         private final int port;
         private final String instanceId; // null quando o worker é local/manual
         private final AtomicInteger activeRequests = new AtomicInteger(0);
+        private final AtomicLong estimatedWork = new AtomicLong(0);
 
         public Worker(String host, int port) {
             this(host, port, null);
@@ -57,6 +59,18 @@ public class WorkerPool {
             activeRequests.decrementAndGet();
         }
 
+        public long getEstimatedWork() {
+            return estimatedWork.get();
+        }
+
+        public void addEstimatedWork(long work) {
+            estimatedWork.addAndGet(work);
+        }
+
+        public void removeEstimatedWork(long work) {
+            estimatedWork.addAndGet(-work);
+        }
+
         /**
          * Health check: try to reach the worker's root endpoint.
          */
@@ -80,7 +94,8 @@ public class WorkerPool {
         @Override
         public String toString() {
             String id = instanceId != null ? " [" + instanceId + "]" : "";
-            return host + ":" + port + id + " (active=" + activeRequests.get() + ")";
+            return host + ":" + port + id + " (active=" + activeRequests.get()
+                    + ", estWork=" + estimatedWork.get() + ")";
         }
     }
 
@@ -166,7 +181,8 @@ public class WorkerPool {
     }
 
     /**
-     * Select the worker with the fewest active requests (least-loaded).
+     * Select the worker with the least estimated work (least-loaded).
+     * Falls back to active request count when no estimated work is tracked.
      * Returns null if no workers are available.
      */
     public Worker selectLeastLoaded() {
@@ -175,7 +191,10 @@ public class WorkerPool {
         }
         Worker best = workers.get(0);
         for (Worker w : workers) {
-            if (w.getActiveRequests() < best.getActiveRequests()) {
+            if (w.getEstimatedWork() < best.getEstimatedWork()) {
+                best = w;
+            } else if (w.getEstimatedWork() == best.getEstimatedWork()
+                    && w.getActiveRequests() < best.getActiveRequests()) {
                 best = w;
             }
         }
@@ -245,6 +264,7 @@ public class WorkerPool {
 
     /**
      * Select the least-loaded worker excluding a set of already-tried workers.
+     * Uses estimated work as primary metric, falling back to active requests.
      * Used for retry logic — avoids sending to a worker that already failed.
      * Returns null if no eligible workers are available.
      */
@@ -254,7 +274,10 @@ public class WorkerPool {
             if (excluded.contains(w)) {
                 continue;
             }
-            if (best == null || w.getActiveRequests() < best.getActiveRequests()) {
+            if (best == null || w.getEstimatedWork() < best.getEstimatedWork()) {
+                best = w;
+            } else if (best != null && w.getEstimatedWork() == best.getEstimatedWork()
+                    && w.getActiveRequests() < best.getActiveRequests()) {
                 best = w;
             }
         }

@@ -92,6 +92,7 @@ public class LoadBalancer {
             String requestType = path.substring(1); // remove leading /
             Map<String, String> params = parseQuery(query);
             ComplexityEstimator.Estimate estimate = complexityEstimator.estimate(requestType, params);
+            long estimatedCost = estimate.getEstimatedBasicBlocks();
             System.out.println("[LoadBalancer] Complexity estimate for " + path + ": " + estimate);
 
             // Try forwarding with retry on failure.
@@ -100,7 +101,7 @@ public class LoadBalancer {
             boolean success = false;
 
             for (int attempt = 0; attempt < maxRetries && !success; attempt++) {
-                // Select least-loaded worker not yet tried.
+                // Select least-loaded worker not yet tried (uses estimatedWork).
                 WorkerPool.Worker worker = workerPool.selectLeastLoadedExcluding(triedWorkers);
                 if (worker == null) {
                     break;
@@ -116,6 +117,7 @@ public class LoadBalancer {
                 System.out.println("[LoadBalancer] Forwarding " + path + " -> " + worker + " (attempt " + (attempt + 1) + ")");
 
                 worker.incrementActive();
+                worker.addEstimatedWork(estimatedCost);
                 try {
                     HttpRequest request = HttpRequest.newBuilder()
                             .uri(URI.create(targetUrl))
@@ -140,6 +142,7 @@ public class LoadBalancer {
                 } catch (Exception e) {
                     System.err.println("[LoadBalancer] Worker " + worker + " failed: " + e.getMessage());
                 } finally {
+                    worker.removeEstimatedWork(estimatedCost);
                     worker.decrementActive();
                 }
             }
