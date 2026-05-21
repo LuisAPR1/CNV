@@ -35,7 +35,7 @@ if [ "$#" -gt 0 ]; then
     info "Workers existentes a registar no arranque: $*"
     for iid in "$@"; do
         ip=$(aws ec2 describe-instances --instance-ids "$iid" --region "$AWS_REGION" \
-            --query "Reservations[0].Instances[0].PublicIpAddress" --output text 2>/dev/null || echo "")
+            --query "Reservations[0].Instances[0].PrivateIpAddress" --output text 2>/dev/null || echo "")
         ip=$(sanitize "$ip")
         if [ -n "$ip" ] && [ "$ip" != "None" ]; then
             WORKER_ARGS="$WORKER_ARGS $ip:$WORKER_PORT"

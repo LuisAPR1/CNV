@@ -121,6 +121,15 @@ public class WorkerPool {
     public Worker addWorker(String host, int port, String instanceId) {
         for (Worker existing : workers) {
             if (existing.getHost().equals(host) && existing.getPort() == port) {
+                // Update instanceId if the existing worker was added without one
+                // (e.g. from CLI args) and we now have it from discoverExistingWorkers.
+                if (existing.getInstanceId() == null && instanceId != null) {
+                    workers.remove(existing);
+                    Worker updated = new Worker(host, port, instanceId);
+                    workers.add(updated);
+                    System.out.println("[WorkerPool] Updated worker instanceId: " + updated);
+                    return updated;
+                }
                 System.out.println("[WorkerPool] Skip duplicate (already present): " + existing);
                 return existing;
             }

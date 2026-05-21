@@ -203,8 +203,8 @@ public class AutoScaler {
             String instanceId = inst.getInstanceId();
             System.out.println("[AutoScaler] Instância lançada: " + instanceId + " — a aguardar IP...");
 
-            String publicIp = waitForPublicIp(instanceId);
-            if (publicIp == null) {
+            String privateIp = waitForPrivateIp(instanceId);
+            if (privateIp == null) {
                 System.err.println("[AutoScaler] Timeout à espera do IP de " + instanceId
                         + ". A terminar a instância.");
                 ec2.terminateInstances(new TerminateInstancesRequest()
@@ -212,23 +212,23 @@ public class AutoScaler {
                 return;
             }
 
-            workerPool.addWorker(publicIp, AwsConfig.WORKER_PORT, instanceId);
+            workerPool.addWorker(privateIp, AwsConfig.WORKER_PORT, instanceId);
             lastScalingAction = System.currentTimeMillis();
-            System.out.println("[AutoScaler] Worker " + instanceId + " @ " + publicIp + " adicionado ao pool.");
+            System.out.println("[AutoScaler] Worker " + instanceId + " @ " + privateIp + " adicionado ao pool.");
             System.out.println("[AutoScaler] systemd cnv-worker.service arrancará automaticamente (~30-60s para servir pedidos).");
         } catch (Exception e) {
             System.err.println("[AutoScaler] Falha no SCALE UP: " + e.getMessage());
         }
     }
 
-    private String waitForPublicIp(String instanceId) {
+    private String waitForPrivateIp(String instanceId) {
         for (int i = 0; i < 60; i++) { // até ~2 minutos
             try {
                 DescribeInstancesResult dr = ec2.describeInstances(
                         new DescribeInstancesRequest().withInstanceIds(instanceId));
                 for (Reservation r : dr.getReservations()) {
                     for (Instance inst : r.getInstances()) {
-                        String ip = inst.getPublicIpAddress();
+                        String ip = inst.getPrivateIpAddress();
                         String state = inst.getState().getName();
                         if ("running".equals(state) && ip != null && !ip.isEmpty()) {
                             return ip;
@@ -306,7 +306,7 @@ public class AutoScaler {
         int discovered = 0;
         for (Reservation r : res.getReservations()) {
             for (Instance inst : r.getInstances()) {
-                String ip = inst.getPublicIpAddress();
+                String ip = inst.getPrivateIpAddress();
                 if (ip != null) {
                     workerPool.addWorker(ip, AwsConfig.WORKER_PORT, inst.getInstanceId());
                     discovered++;
