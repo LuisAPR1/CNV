@@ -98,11 +98,17 @@ public class MetricsStorageService {
             item.put(SORT_KEY, new AttributeValue().withS(
                     request.getTimestamp() + "_" + UUID.randomUUID().toString().substring(0, 8)));
 
-            // Métricas (guardadas como Number para permitir queries/aggregations)
+            // Métricas (guardadas como Number para permitir queries/aggregations).
+            //   - instructionCount  → métrica primária (ICount); usada pelo ComplexityEstimator.
+            //   - methodCallCount   → métrica secundária (cross-check / diagnóstico).
+            //   - elapsedTimeMs     → métrica de validação (correlação com ICount estimado).
+            // NOTA: o campo legado "basicBlockCount" foi descontinuado em 2026-05-21
+            // (ver docs/01.5_icount_migration.md). Registos antigos com esse campo
+            // são ignorados pelo estimador.
             item.put("methodCallCount", new AttributeValue().withN(
                     String.valueOf(request.getMethodCallCount())));
-            item.put("basicBlockCount", new AttributeValue().withN(
-                    String.valueOf(request.getBasicBlockCount())));
+            item.put("instructionCount", new AttributeValue().withN(
+                    String.valueOf(request.getInstructionCount())));
             item.put("elapsedTimeMs", new AttributeValue().withN(
                     String.valueOf(request.getElapsedTimeMs())));
             item.put("timestamp", new AttributeValue().withN(

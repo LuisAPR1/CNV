@@ -1,0 +1,289 @@
+CNV-25-26 FAQ Online
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+Note: do not waste cloud resources while experimenting with the project workloads. 
+In this initial stage, to experiment and explore the project workloads’ instrumentation and assessment/estimation of request complexity/cost using Javassist, for different workloads and parameters/ranges, use only local resources (PC, laptop, lab machines, etc.). 
+Do not run lengthy executions or perform configuration/parameter exploration of the workloads in AWS resources!!!
+ 
+Note: as of recently, AWS is metering and eventually charging for the virtual private clouds that are set up while they are operational, even if no VMs and no load balancers are active. So, while not using AWS, delete any VPC that you may have set up earlier. Additionally, because of this, do not leave load balancers created abandoned even when there are no VMs executing (i.e., the AutoScale group has been destroyed).
+-------------------------------------------------------------------------------------------------------------------------------------------------
+Project Specification: available here.
+http://grupos.ist.utl.pt/meic-cnv/project/CNV_25_26_Project.pdf
+Project Workloads Repository to clone: available here. 
+https://gitlab.rnl.tecnico.ulisboa.pt/cnv/cnv26-groups/cnv-26-gxx
+Sample Interactive Web Page (to invoke web servers from browser): available here.
+http://grupos.ist.utl.pt/meic-cnv/project/ 
+Project FAQ (incrementally updated): available here.
+https://tinyurl.com/CNV-25-26-FAQ 
+------------------------------------------------------------------------------------------------------------------------------------------------
+
+CNV-25-26 Project Checkpoint Visualization Guide
+For the checkpoint visualization, to check what is the core functionality operating in the project, we ask you to make a short video by screen recording a complete visualization of your project following the steps presented below. 
+When displaying functionality, please narrate in English if possible what you are doing (there is no evaluation of the speech!!!) and feel free to highlight any output or debug information that helps to make more clear what is happening.
+The requests listed at the end are linux shell scripts and are indicative. At the end, show the printed results of the requests to confirm execution. If needed, use command line requests directly or employ the web user interface.
+With different instrumentation tools and different scaling policies, the behavior may vary. You may adjust the requests to achieve the intended purposes. The video is to display workload functionality operating on AWS.
+Recall: the purpose of the short video is to obtain, in the simplest and fastest way possible, evidence of what the project is able to do at this checkpoint. It is not to explain options or code quality. We just want to see if the project works at AWS, if it's multi-threaded, if it's instrumented and exporting statistics (e.g. to file), if it scales out (and then scales in) and if it's redirecting load balancing across the instances.
+Thank you. Good work.
+Video Setup and Delivery
+The video should be made available by Sunday May 24th at 11h59 (midday/noon). 
+Upload (e.g., to Dropbox, Google Drive, ...) a Zip file named cnv-25-26-vis-chk-GXX.zip (where XX is your group number) containing:
+your visualization video 
+quick description file (README.txt) of any adjustments you had to do to these instructions 
+(e.g. sections skipped, executed in another order, if you need to scale up before carrying out any load balancing, if it does not scale, etc.).
+Send the download link to meic-cnv@tecnico.ulisboa.pt with subject “cnv-25-26-vis-chk-GXX” .
+Part 0: Set-up
+a) Get your code from the repository if you need to build any AMI image or show the files dates and times in the instances you create from the AMI image your VMs were using when submitting the project.
+Part 1: Basic Requests (i.e. see the project work)
+a) Launch one worker on EC2, show the result on AWS Web Console.
+
+b) Run one request of each type (i.e. one fractals, grayscott, dna workload) in the worker using the web interface.
+
+c) Set up (if it is not already) the LB on EC2 (or local if you do not support it). Show result on AWS Web Console.
+
+d) Run one request of each type through the LB using the web interface.
+Part 2: Scaling Out (i.e. check creating workers)
+a) Employing the tests scripts provided (links below) and modifying if it needs to fit your project, e.g., workload parameters, generate load on your system (e.g., execute the scripts more than once in parallel if needed so that your scaler will scale up), so that your scaler decides to scale up.
+
+b) Show the instances' panel in AWS Web Console to verify that a new instance is being launched.
+Part 3: Load Balancing (i.e. check worker selection for requests)
+a) Confirm that you have more than one worker running.
+
+b) Open an SSH connection to each worker instance and execute the linux top command.
+
+d) Show the top output on at least two instances at the same time. 
+(we want to confirm CPU utilization on both/all workers, use top in shell to measure CPU usage).
+Part 4: Scaling In (i.e. check terminating workers)
+c) Stop issuing requests so that the cluster can scale down.
+
+d) Show the instances' panel in AWS Web Console to verify that an instance was terminated.
+Part 5: Metrics (i.e. check recording of metrics)
+a) Show printed debug information of the contents of the files where you are storing information about requests and the metrics obtained for each request.
+
+Post-Video: make sure not to leave AWS resources unattended while not working!!!
+
+References
+Scripts folder:
+http://grupos.ist.utl.pt/~meic-cnv.daemon/project/tests-checkpoint/
+
+Requests of each workload are organized as their approximate load: XS, S, M, L, and XL.
+
+Employ the to show the functionality of each workload (e.g., XS or S) and then combine them to generate load in the system with the heavier requests of diverse workloads, if necessary in parallel (as they each generate unique output files when needed).
+
+Good work!
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+You can explore executing the codebase as instructed below. 
+
+You can begin to determine how the arguments passed to the workloads end up influencing the complexity (i.e., cost according to a metric extracted via instrumentation) of each request. 
+
+This can help guide heuristics, estimations, etc. of subsequent requests with similar/related arguments. Later, you only need to instrument the classes that actually execute the workloads, not the webserver and handler entry points code itself (as it does not do any useful work whose cost to be assessed).
+
+You should be able to check and test the code base on the gitlab cnv-26-gxx repository. You will have your own private repository later on.
+
+CNV-25-26 Explanation of the Workload Code Base:
+
+This project contains three sub-projects:
+
+1. fractals - the Julia-set fractals workload
+2. grayscott - the Gray-Scott simulation workload
+3. dna - the DNA-genome matcher workload
+
+Refer to the README.md files of the sub-projects in gitlab to get more details for each specific sub-project.
+
+How to build everything:
+1. Make sure your `JAVA_HOME` environment variable is set to Java 11+ distribution
+2. Run `mvn clean package`
+
+WebServer:
+This project contains a web server that exposes functionality of all the three workload projects.
+
+How to build:
+1. Make sure your `JAVA_HOME` environment variable is set to Java 11+ distribution
+2. Run `mvn clean package`
+
+How to run locally:
+To run Web Server locally, execute this command:
+
+> java -cp target/webserver-1.0.0-SNAPSHOT-jar-with-dependencies.jar pt.ulisboa.tecnico.cnv.webserver.WebServer
+
+
+
+Fractals (Julia-Set Fractals):
+This project contains Julia set fractals generation functionality. It generates a fractal image, based on image width, height, and number of iterations of the Julia function.
+
+How to build:
+1. Make sure your `JAVA_HOME` environment variable is set to Java 11+ distribution
+2. Run `mvn clean package`
+
+How to run locally:
+To run this workload locally in CLI, execute this command:
+
+java -cp target/fractals-1.0.0-SNAPSHOT-jar-with-dependencies.jar pt.ulisboa.tecnico.cnv.fractals.FractalsHandler <width> <height> <iterations> <output_image.png>
+
+e.g.: 
+java -cp target/fractals-1.0.0-SNAPSHOT-jar-with-dependencies.jar pt.ulisboa.tecnico.cnv.fractals.FractalsHandler 800 600 100 ./julia.png
+
+If you want to test your workloads through the Web Server locally without using the browser, you can use curl in the command line.
+
+If you want to use the browser, you can use ifconfig in the VM to get your public IP inside the virtualized network in your machine.
+
+For requests with curl:
+
+curl -s "http://127.0.0.1:8000/fractals?w=800&h=600&iterations=100" | awk -F',' '{print $2}' | tr -d '" \n\r' | base64 -d > julia.png
+
+GrayScott (Gray-Scott Reaction-Diffusion):
+This project contains Gray-Scott reaction-diffusion pattern generation functionality. It simulates interaction of two chemicals, according to Gray-Scott model, based on region size, max iterations, substance feed and kill rates, stopping condition on extinction, and seed mode (original distribution).
+
+How to build:
+1. Make sure your `JAVA_HOME` environment variable is set to Java 11+ distribution
+2. Run `mvn clean package`
+
+How to run locally:
+To run this workload locally in CLI, execute this command:
+
+java -cp target/grayscott-1.0.0-SNAPSHOT-jar-with-dependencies.jar pt.ulisboa.tecnico.cnv.grayscott.GrayScottHandler <size> <maxIterations> <feedF> <killK> <stopOnExtinction:true|false> <seedMode:center|ring|stripe> [output_image.png]
+
+e.g.:
+java -cp target/grayscott-1.0.0-SNAPSHOT-jar-with-dependencies.jar pt.ulisboa.tecnico.cnv.grayscott.GrayScottHandler 256 10000 0.030 0.062 false stripe grayscott.png
+
+For requests with curl:
+
+curl -s "http://127.0.0.1:8000/grayscott?size=256&maxIterations=10000&f=0.030&k=0.062&stopOnExtinction=false&seedMode=stripe" | awk -F',' '{print $2}' | tr -d '" \n\r' | base64 -d > grayscott.png
+
+DNA (DNA Genome Matcher):
+This project contains DNA genome matcher functionality. It carries out a DNA Genome matching highlighting DNA matches, based on two FASTA sequences, minimum match length, and stopping condition on the first match.
+
+This project contains functionality that simulates cellular life evolution according to Conway's Game of Life rules given a map with a cellular pattern and the number of iterations. Returns the final state of the map.
+
+How to build:
+1. Make sure your `JAVA_HOME` environment variable is set to Java 11+ distribution
+2. Run `mvn clean package`
+
+How to run locally:
+To run this workload locally in CLI, execute this command:
+
+> java -cp target/dna-1.0.0-SNAPSHOT-jar-with-dependencies.jar pt.ulisboa.tecnico.cnv.dna.DnaHandler [seq_name1:]<seq_fasta1> [seq_name2:]<seq_fasta2> [minLength] [stopOnFirst]
+
+> java -cp target/dna-1.0.0-SNAPSHOT-jar-with-dependencies.jar pt.ulisboa.tecnico.cnv.dna.DnaHandler human_HBB:ATGGTGCATCTGACTCCTGAGGAGAAGTCTGCCGTTACTGCCCTGTGGGGCAAGGTGAACGTGGATGAAGTTGGTGGTGAGGCCCTGGGCAGGCTGCTGGTGGTCTACCCTTGGACCCAGAGGTTCTTTGAGTCCTTTGGGGATCTGTCCACTCCTGATGCTGTTATGGGCAACCCTAAGGTGAAGGCTCATGGCAAGAAAGTGCTCGGTGCCTTTAGTGATGGCCTGGCTCACCTGGACAACCTCAAGGGCACCTTTGCCACACTGAGTGAGCTGCACTGTGACAAGCTGCACGTGGATCCTGAGAACTTCAGGCTCCTGGGCAACGTGCTGGTCTGTGTGCTGGCCCATCACTTTGGCAAAGAATTCACCCCACCAGTGCAGGCTGCCTATCAGAAAGTGGTGGCTGGTGTGGCTAATGCCCTGGCCCACAAGTATCACTAA chimpanzee_HBB:ATGGTGCACCTGACTCCTGAGGAGAAGTCTGCCGTTACTGCCCTGTGGGGCAAGGTGAACGTGGATGAAGTTGGTGGTGAGGCCCTGGGCAGGCTGCTGGTGGTCTACCCTTGGACCCAGAGGTTCTTTGAGTCCTTTGGGGATCTGTCCACTCCTGATGCTGTTATGGGCAACCCTAAGGTGAAGGCTCATGGCAAGAAAGTGCTCGGTGCCTTTAGTGATGGCCTGGCTCACCTGGACAACCTCAAGGGCACCTTTGCCACACTGAGTGAGCTGCACTGTGACAAGCTGCACGTGGATCCTGAGAACTTCAGGCTCCTGGGCAACGTGCTGGTCTGTGTGCTGGCCCATCACTTTGGCAAAGAATTCACCCCACCAGTGCAGGCTGCCTATCAGAAAGTGGTGGCTGGTGTGGCTAATGCCCTGGCCCACAAGTATCACTAA 5 False
+
+For requests with curl:
+
+SEQ1=human_HBB:ATGGTGCATCTGACTCCTGAGGAGAAGTCTGCCGTTACTGCCCTGTGGGGCAAGGTGAACGTGGATGAAGTTGGTGGTGAGGCCCTGGGCAGGCTGCTGGTGGTCTACCCTTGGACCCAGAGGTTCTTTGAGTCCTTTGGGGATCTGTCCACTCCTGATGCTGTTATGGGCAACCCTAAGGTGAAGGCTCATGGCAAGAAAGTGCTCGGTGCCTTTAGTGATGGCCTGGCTCACCTGGACAACCTCAAGGGCACCTTTGCCACACTGAGTGAGCTGCACTGTGACAAGCTGCACGTGGATCCTGAGAACTTCAGGCTCCTGGGCAACGTGCTGGTCTGTGTGCTGGCCCATCACTTTGGCAAAGAATTCACCCCACCAGTGCAGGCTGCCTATCAGAAAGTGGTGGCTGGTGTGGCTAATGCCCTGGCCCACAAGTATCACTAA
+
+SEQ2=chimpanzee_HBB:ATGGTGCACCTGACTCCTGAGGAGAAGTCTGCCGTTACTGCCCTGTGGGGCAAGGTGAACGTGGATGAAGTTGGTGGTGAGGCCCTGGGCAGGCTGCTGGTGGTCTACCCTTGGACCCAGAGGTTCTTTGAGTCCTTTGGGGATCTGTCCACTCCTGATGCTGTTATGGGCAACCCTAAGGTGAAGGCTCATGGCAAGAAAGTGCTCGGTGCCTTTAGTGATGGCCTGGCTCACCTGGACAACCTCAAGGGCACCTTTGCCACACTGAGTGAGCTGCACTGTGACAAGCTGCACGTGGATCCTGAGAACTTCAGGCTCCTGGGCAACGTGCTGGTCTGTGTGCTGGCCCATCACTTTGGCAAAGAATTCACCCCACCAGTGCAGGCTGCCTATCAGAAAGTGGTGGCTGGTGTGGCTAATGCCCTGGCCCACAAGTATCACTAA
+
+curl "http://localhost:8000/dna?seq1=$SEQ1&seq2=$SEQ2&minLength=5&stopOnFirst=False"
+
+Sample Interactive Web Page (to invoke web servers from browser): 
+http://grupos.ist.utl.pt/meic-cnv/project/
+
+CNV-25-26 Sprint 1 (suggested Next Steps and “Sprint” for the Checkpoint):
+1. Build and test the Nature@Cloud application that is given to you. Make sure you can start the WebServer and send requests to it. Make sure your WebServer is able to handle multiple requests at the same time;
+
+2. Start instrumenting the workloads using a JavassistAgent to extract a number of desired metrics:
+	2.1. Check Lab 3 guide for Javassist operation, the different types of metrics and how they extend (i.e., add) to the application code. Hint: use ICount as a starting point for your Javassist tool;
+
+E.g. of invocation of javassist to instrument the workload: 
+
+java -cp webserver/target/webserver-1.0.0-SNAPSHOT-jar-with-dependencies.jar -Xbootclasspath/a:javassist/target/JavassistWrapper-1.0-jar-with-dependencies.jar -javaagent:webserver/target/webserver-1.0.0-SNAPSHOT-jar-with-dependencies.jar=ICount:pt.ulisboa.tecnico.cnv.fractals,pt.ulisboa.tecnico.cnv.grayscott,pt.ulisboa.tecnico.cnv.dna:output pt.ulisboa.tecnico.cnv.webserver.WebServer
+
+Adapt maven .pom file of the webserver, by uncommenting commented lines, that workloads are accessible to instrumentation, so the following lines become uncommented. Be sure to copy the javassist folder into your group repository.
+
+<archive>
+                    <manifestFile>../javassist/src/main/resources/META-INF/MANIFEST.MF</manifestFile>
+             </archive>
+
+	2.2. The collected metrics can be initially logged to file, so that you can understand how different requests (and parameters) result in different values for the metrics. 
+
+You can freely change the code of the web request handlers in each of the workloads. 
+
+You can change the code to print statistics at the end of each request. 
+
+You can change the code to retrieve the arguments of each request and export them alongside with the metrics collected.
+
+Use or extend the tools with methods to reset statistics, so that your web handlers can invoke them at the end (or beginning) of each request for accurate measurements (and not accumulate metrics about several (all) requests made to the same server).
+
+	2.3. The analysis routines in Javassist tools that gather the statistics regarding the instrumented classes are designed for single-thread. You should take into account the ID of the thread providing the metrics (otherwise, your analysis routines will just accumulate global information to all requests running in the instance, and not specific to each request as it is intended), e.g., use Thread.currentThread().getId().
+
+2.4. Take into account that instrumentation results in additional bytecodes in classes (even if you do not export the instrumented classes to disk, they are being injected in the bytecode and being executed), and consequently, execution overhead, i.e., less of useful work done by your cloud resources.
+
+3. Once you have set up your code instrumentation of the workloads, you can prepare an AMI (Amazon Machine Image) that starts the WebServer automatically upon VM startup. You can either manually setup the VM before creating the AMI, or adapt the Amazon CLI scripts provided to your in Lab 2 to automatically setup and create the AMI;
+
+4. Design your LB and AS. As a first step, you can set up the AWS-provided LB and AS with the appropriate parameters, triggers/conditions and handling behavior (as in Lab 2). This way, you can make sure your application scales even without developing a programmatic LB and AS yet. 
+
+(Later, you will start developing your own Java-based LB and AS and gradually replace the AWS-provided components).
+
+5. Design/Decide your own set of metrics to extract via instrumentation:
+5.1 A good metric (or set of metrics) is one that maximizes the quality of the information that you can use to estimate a request’s complexity, based on its arguments and information from previously 
+served requests, at the expense of as little as possible execution overhead. 
+
+5.2 This balance is what your experimentation and creativity must solve. Check Lab 3 as the set of  tools provided can be regarded as a “swiss-army knife” that you can use to explore this design aspect.
+
+6. Write a 1-page report. Remember that the report must include a summary of all the components developed so far and, in addition to that, ideas/pseudo-code/designs for:
+	6.1 Scheduling strategy for the LB;
+	6.2 Scaling policy for the AS;
+	6.3 Instrumentation metrics (and if already decided, how it will be integrated with the MSS).
+
+When developing your pseudocode for the load balancing (and auto scaling), recall the strategies/policies that can be defined in the OpenStack Nova Scheduler: spreading for load balancing; and packing for consolidation. You can take them as inspiration (and possibly combine them), as you see fit, in order to decide how to handle each arriving request, in face of the current resource usage across the cluster.
+
+Accessing instrumentation metrics from outside code: 
+To have your web server code access the statistics gathered by the instrumented code for each specific request, the instrumentation tool classes must expose those metrics, e.g., through public methods, that receive arguments that allow retrieving the metrics of each specific request. 
+
+You should not make the instrumentation tools write to specific files or directly issue requests to cloud storage. It is not very good design to tie the instrumentation tools to a specific task of your project and to make it instrument a specific method (e.g., game iteration method) just to output metrics. 
+
+It should be your WebServer class or handler classes to get these metrics from the tool classes and write them to file (with the request parameters) and, later on, to cloud storage (MSS). Instrumentation code instruments and records metrics in a shared data structure. 
+
+The handler classes should be able to access these shared data structures or methods in the tool, for example, to write and read metrics and other shared data when handling the workload. (One example would be to invoke a method to initialize any data just before the handler runs the workload and invoke another method to read the obtained metrics just after the workload is processed.) 
+
+The WebServer can then push the data into a file or remote storage.
+In order to allow your WebServer and handlers classes to access shared data structure and metrics from the tool, you may need to modify the dependencies of your project.
+Ensure that Javassist module is compiled before any other modules in the main pom.xml of your project, e.g.,:
+
+<modules>
+<module>javassist</module>
+<module>webserver</module>
+<module>fractals</module>
+<module>dna</module>
+<module>grayscott</module>
+
+</modules>
+
+
+Specify a dependency for Javassist in the pom.xml files of the WebServer and all three handlers:
+
+<dependency>
+<groupId>pt.ulisboa.tecnico</groupId>
+<artifactId>JavassistWrapper</artifactId>
+<version>1.0</version>
+<scope>compile</scope>
+</dependency> 
+
+Import the tool in your WebServer or handler code:
+
+import pt.ulisboa.tecnico.cnv.javassist.tools.ICount;
+
+
+Access shared data structures or through public static methods, e.g.,:
+
+ICount.ninsts = …;
+ICount.printStatistics();
+
+Each request is already handled in a separate thread from a thread pool but it is up to your code to obtain and maintain the necessary information so that you can assign a correct individual cost (based on instrumentation metrics) to each request (i.e., no overflows, no metric accumulations from other parallel requests or previous requests run in the same thread from the thread pool that is being used by the web server code). 
+
+Take into account that all threads will execute the same instrumented code (the analysis routines) and they are not ready for this as such. Moreover, the web server never exits so the code to print/output Javassist tools statistics/metrics, as such will never print results.  You must handle this and obtain the metrics for each request from the Javassist tools in the web handlers code.
+
+==================================================================================
+
+Handling and forwarding web requests at the LB:
+Later, to implement your programmatic load balancer, you will have to develop a web server (as the one we provide in Lab AWS, multithreading can be achieved as in the workload handlers) that sends web requests to the worker nodes, and send their responses back to the clients, acting as an intermediary. Use the code already given to you in your repository (namely the WebServer.java, with multithreading and web handlers of each of the workloads) for inspiration.
+
+For executing a GET request in Java, you can use the following example:
+
+private String get(String path) throws Exception {
+    HttpClient client = HttpClient.newHttpClient();
+    HttpRequest request = HttpRequest.newBuilder()
+        .uri(URI.create("http://" + WORKER_IP + ":" + WORKER_PORT + "/" + path))
+        .GET()
+        .build();
+    return client.send(request, HttpResponse.BodyHandlers.ofString()).body();
+}

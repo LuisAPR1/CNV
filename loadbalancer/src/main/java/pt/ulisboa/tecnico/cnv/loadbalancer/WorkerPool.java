@@ -169,6 +169,28 @@ public class WorkerPool {
     }
 
     /**
+     * Per-worker hard cap on accumulated estimated work, in bytecode instructions.
+     * Used by {@link #selectForRequest(long, java.util.Set)} as the upper bound
+     * of the packing phase: if adding this request would push a worker above
+     * this cap, that worker is excluded from packing (forcing spread to a less
+     * loaded peer or, if none, scale-up at the AutoScaler level).
+     *
+     * <p>Calibration 2026-05-21 based on local empirical measurements (see
+     * {@code docs/01.6_calibration_evidence.md}):
+     * <ul>
+     *   <li>Heaviest single request observed: GrayScott s256 maxIter=1000 ≈ 1.08×10¹⁰.</li>
+     *   <li>Extrapolated worst case (GrayScott 512×10000): ~4.3×10¹¹ instr.</li>
+     *   <li>Pack threshold set at <b>5×10¹⁰</b> = ~5 medium requests or 1 heavy
+     *       request worth of work per worker before triggering spreading.</li>
+     * </ul>
+     *
+     * <p>This is intentionally tighter than the previous 4×10¹¹ value — packing
+     * becomes more aggressive about leaving workers idle, which helps the
+     * AutoScaler consolidate during low-load periods.
+     */
+    public static final long DEFAULT_MAX_CAPACITY = 50_000_000_000L;
+
+    /**
      * Select the next worker using round-robin.
      * Returns null if no workers are available.
      */
@@ -184,6 +206,9 @@ public class WorkerPool {
      * Select the worker with the least estimated work (least-loaded).
      * Falls back to active request count when no estimated work is tracked.
      * Returns null if no workers are available.
+     *
+     * <p>This is pure <b>spreading</b>. Prefer {@link #selectForRequest(long, java.util.Set)}
+     * for the production routing path (hybrid packing+spreading aware of cost).
      */
     public Worker selectLeastLoaded() {
         if (workers.isEmpty()) {
@@ -199,6 +224,53 @@ public class WorkerPool {
             }
         }
         return best;
+    }
+
+    /**
+     * Hybrid placement strategy: <b>packing within capacity, spreading as fallback</b>.
+     *
+     * <p>Algorithm:
+     * <ol>
+     *   <li>For each candidate worker (not in {@code excluded}), let
+     *       {@code projected = currentLoad + requestCost}.</li>
+     *   <li><b>Packing phase</b>: among workers whose {@code projected} stays
+     *       under {@link #DEFAULT_MAX_CAPACITY}, pick the one with the
+     *       <b>highest</b> current load. This consolidates work onto already-busy
+     *       workers and leaves idle workers eligible for scale-down.</li>
+     *   <li><b>Spreading fallback</b>: if no candidate fits the cap (i.e. every
+     *       worker would exceed it after this request), pick the
+     *       <b>least-loaded</b> worker. The request still gets served, but the
+     *       AutoScaler will see the spike and trigger scale-up next cycle.</li>
+     * </ol>
+     *
+     * <p>Returns {@code null} only if {@code excluded} contains all workers
+     * (i.e. all retries already exhausted).
+     *
+     * @param requestCost estimated cost (instructions) of the new request
+     * @param excluded    workers already tried (e.g. for retry on failure)
+     */
+    public Worker selectForRequest(long requestCost, Set<Worker> excluded) {
+        if (workers.isEmpty()) return null;
+        if (requestCost < 0) requestCost = 0;
+
+        Worker bestPack = null;        // most-loaded worker still under cap
+        Worker bestSpread = null;      // least-loaded worker (any cap)
+        for (Worker w : workers) {
+            if (excluded != null && excluded.contains(w)) continue;
+            long load = w.getEstimatedWork();
+            long projected = load + requestCost;
+            // spreading fallback candidate
+            if (bestSpread == null || load < bestSpread.getEstimatedWork()) {
+                bestSpread = w;
+            }
+            // packing candidate (only if it fits under the cap)
+            if (projected <= DEFAULT_MAX_CAPACITY) {
+                if (bestPack == null || load > bestPack.getEstimatedWork()) {
+                    bestPack = w;
+                }
+            }
+        }
+        return bestPack != null ? bestPack : bestSpread;
     }
 
     /**

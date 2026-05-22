@@ -23,17 +23,17 @@ public class MetricRegistry {
         private final String requestType;
         private final Map<String, String> parameters;
         private final long methodCallCount;
-        private final long basicBlockCount;
+        private final long instructionCount;
         private final long elapsedTimeMs;
         private final long timestamp;
 
         public CompletedRequest(String requestType, Map<String, String> parameters,
-                                long methodCallCount, long basicBlockCount,
+                                long methodCallCount, long instructionCount,
                                 long elapsedTimeMs, long timestamp) {
             this.requestType = requestType;
             this.parameters = Collections.unmodifiableMap(new HashMap<>(parameters));
             this.methodCallCount = methodCallCount;
-            this.basicBlockCount = basicBlockCount;
+            this.instructionCount = instructionCount;
             this.elapsedTimeMs = elapsedTimeMs;
             this.timestamp = timestamp;
         }
@@ -41,7 +41,8 @@ public class MetricRegistry {
         public String getRequestType() { return requestType; }
         public Map<String, String> getParameters() { return parameters; }
         public long getMethodCallCount() { return methodCallCount; }
-        public long getBasicBlockCount() { return basicBlockCount; }
+        /** Bytecode instructions executed inside the instrumented packages (primary metric). */
+        public long getInstructionCount() { return instructionCount; }
         public long getElapsedTimeMs() { return elapsedTimeMs; }
         public long getTimestamp() { return timestamp; }
 
@@ -53,7 +54,7 @@ public class MetricRegistry {
             Map<String, String> map = new HashMap<>();
             map.put("requestType", requestType);
             map.put("methodCallCount", String.valueOf(methodCallCount));
-            map.put("basicBlockCount", String.valueOf(basicBlockCount));
+            map.put("instructionCount", String.valueOf(instructionCount));
             map.put("elapsedTimeMs", String.valueOf(elapsedTimeMs));
             map.put("timestamp", String.valueOf(timestamp));
             for (Map.Entry<String, String> entry : parameters.entrySet()) {
@@ -64,8 +65,8 @@ public class MetricRegistry {
 
         @Override
         public String toString() {
-            return String.format("[%s] params=%s, methods=%d, basicblocks=%d, time=%dms",
-                    requestType, parameters, methodCallCount, basicBlockCount, elapsedTimeMs);
+            return String.format("[%s] params=%s, methods=%d, instructions=%d, time=%dms",
+                    requestType, parameters, methodCallCount, instructionCount, elapsedTimeMs);
         }
     }
 
@@ -75,7 +76,7 @@ public class MetricRegistry {
      */
     public static class RequestMetrics {
         private long methodCallCount = 0;
-        private long basicBlockCount = 0;
+        private long instructionCount = 0;
         private long startTime = 0;
         private String requestType = "";
         private Map<String, String> parameters = new HashMap<>();
@@ -88,7 +89,7 @@ public class MetricRegistry {
          */
         public void reset(String uri) {
             this.methodCallCount = 0;
-            this.basicBlockCount = 0;
+            this.instructionCount = 0;
             this.startTime = System.nanoTime();
             parseUri(uri);
         }
@@ -125,7 +126,7 @@ public class MetricRegistry {
         }
 
         public long getMethodCallCount() { return methodCallCount; }
-        public long getBasicBlockCount() { return basicBlockCount; }
+        public long getInstructionCount() { return instructionCount; }
         public String getRequestType() { return requestType; }
         public Map<String, String> getParameters() { return parameters; }
         public long getElapsedTimeMs() { return (System.nanoTime() - startTime) / 1_000_000; }
@@ -138,7 +139,7 @@ public class MetricRegistry {
                     requestType,
                     parameters,
                     methodCallCount,
-                    basicBlockCount,
+                    instructionCount,
                     getElapsedTimeMs(),
                     System.currentTimeMillis()
             );
@@ -146,8 +147,8 @@ public class MetricRegistry {
 
         @Override
         public String toString() {
-            return String.format("[%s] params=%s, methods=%d, basicblocks=%d, time=%dms",
-                    requestType, parameters, methodCallCount, basicBlockCount, getElapsedTimeMs());
+            return String.format("[%s] params=%s, methods=%d, instructions=%d, time=%dms",
+                    requestType, parameters, methodCallCount, instructionCount, getElapsedTimeMs());
         }
     }
 
@@ -168,16 +169,24 @@ public class MetricRegistry {
 
     /**
      * Called by instrumented code at each method entry.
+     * <p>Secondary / cross-check metric. Useful for diagnosing irregularities
+     * between {@link #incrementInstructions(long)} ratios across requests.
      */
     public static void incrementMethodCalls() {
         threadMetrics.get().methodCallCount++;
     }
 
     /**
-     * Called by instrumented code at each basic block entry.
+     * Called by instrumented code at the entry of each basic block, with the
+     * number of bytecode instructions inside that block as the {@code count}.
+     *
+     * <p><b>Primary complexity metric (ICount).</b> Captures the dynamic execution
+     * of the workload: each loop iteration enters its body block once, contributing
+     * its instruction count. The accumulated value scales with the actual work
+     * performed, which is exactly what is needed to estimate request complexity.
      */
-    public static void incrementBasicBlocks(long count) {
-        threadMetrics.get().basicBlockCount += count;
+    public static void incrementInstructions(long count) {
+        threadMetrics.get().instructionCount += count;
     }
 
     /**

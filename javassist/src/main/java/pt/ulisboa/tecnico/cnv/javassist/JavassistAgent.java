@@ -3,15 +3,42 @@ package pt.ulisboa.tecnico.cnv.javassist;
 import java.lang.instrument.ClassFileTransformer;
 import java.lang.instrument.Instrumentation;
 import java.security.ProtectionDomain;
+import java.util.Arrays;
 
 import javassist.ClassPool;
-import javassist.CtBehavior;
 import javassist.CtClass;
 import javassist.CtMethod;
+import javassist.bytecode.BadBytecode;
+import javassist.bytecode.Bytecode;
+import javassist.bytecode.CodeAttribute;
+import javassist.bytecode.CodeIterator;
+import javassist.bytecode.MethodInfo;
+import javassist.bytecode.analysis.ControlFlow;
+import javassist.bytecode.analysis.ControlFlow.Block;
+
+import java.util.HashMap;
+import java.util.Map;
 
 /**
  * Javassist-based Java agent that instruments workload classes at load time
- * to collect execution metrics (method calls, basic blocks).
+ * to collect dynamic execution metrics.
+ *
+ * <p><b>Primary metric: instruction count (ICount).</b> Using {@link ControlFlow}
+ * we identify the basic blocks of every method and, at the entry of each block,
+ * inject {@code MetricRegistry.incrementInstructions(N)} where {@code N} is the
+ * number of bytecode instructions contained in that block. The accumulated
+ * counter scales with the actual work executed (each loop iteration enters its
+ * body block once, contributing its instruction count) and is the metric used
+ * by the load balancer / auto-scaler to estimate request complexity.
+ *
+ * <p><b>Secondary metric: method-call count.</b> A single increment is injected
+ * at the entry of every instrumented method. Used as a cross-check signal
+ * (e.g.&nbsp;to detect anomalies in DNA where method invocations dominate the
+ * inner loop).
+ *
+ * <p>Only classes in {@link #TARGET_PACKAGES} are instrumented — JDK and
+ * webserver framework code are deliberately left out (overhead vs. usefulness
+ * trade-off, see project FAQ).
  */
 public class JavassistAgent {
 
@@ -28,6 +55,10 @@ public class JavassistAgent {
             "pt.ulisboa.tecnico.cnv.grayscott.GrayScottHandler",
             "pt.ulisboa.tecnico.cnv.dna.DnaHandler"
     };
+
+    /** Internal (slash-separated) name of MetricRegistry, used in invokestatic. */
+    private static final String METRIC_REGISTRY_INTERNAL =
+            "pt/ulisboa/tecnico/cnv/javassist/MetricRegistry";
 
     public static void premain(String args, Instrumentation inst) {
         System.out.println("[JavassistAgent] Agent loaded. Instrumenting workload classes...");
@@ -74,23 +105,34 @@ public class JavassistAgent {
                     }
                 }
 
+                int totalBlocks = 0;
+                long totalInstructions = 0;
                 for (CtMethod method : cc.getDeclaredMethods()) {
                     if (method.isEmpty()) continue;
 
-                    // Instrument the handle(HttpExchange) method in handlers
-                    // to start/stop metric collection per request.
+                    // 1) Per-basic-block instruction counters (uses ORIGINAL bytecode
+                    //    offsets). Must run before any insertBefore/insertAfter, which
+                    //    would shift offsets and invalidate the ControlFlow positions.
+                    InstrumentationStats stats = instrumentBasicBlocks(method);
+                    totalBlocks += stats.blocks;
+                    totalInstructions += stats.instructions;
+
+                    // 2) Per-method-call counter at method entry (secondary metric).
+                    method.insertBefore(
+                            "{ pt.ulisboa.tecnico.cnv.javassist.MetricRegistry.incrementMethodCalls(); }");
+
+                    // 3) For handler classes, wrap handle(HttpExchange) with
+                    //    startRequest/stopRequest.
                     if (isHandler && method.getName().equals("handle")
                             && method.getParameterTypes().length == 1) {
                         instrumentHandleMethod(method, dotName);
                     }
-
-                    // Instrument ALL methods to count method calls and basic blocks.
-                    instrumentMethod(method);
                 }
 
                 byte[] bytecode = cc.toBytecode();
                 cc.detach();
-                System.out.println("[JavassistAgent] Instrumented: " + dotName);
+                System.out.println("[JavassistAgent] Instrumented: " + dotName
+                        + " (" + totalBlocks + " blocks, " + totalInstructions + " static instructions)");
                 return bytecode;
 
             } catch (Exception e) {
@@ -116,24 +158,114 @@ public class JavassistAgent {
             method.insertAfter(stopCode, /* asFinally */ true);
         }
 
-        /**
-         * Inserts method-call counting and basic-block counting at the start of each method.
-         */
-        private void instrumentMethod(CtMethod method) throws Exception {
-            // Count this method invocation.
-            method.insertBefore(
-                    "{ pt.ulisboa.tecnico.cnv.javassist.MetricRegistry.incrementMethodCalls(); }");
+        /** Internal carrier for the (blocks, instructions) tuple produced per method. */
+        private static final class InstrumentationStats {
+            final int blocks;
+            final long instructions;
+            InstrumentationStats(int blocks, long instructions) {
+                this.blocks = blocks;
+                this.instructions = instructions;
+            }
+            static final InstrumentationStats EMPTY = new InstrumentationStats(0, 0L);
+        }
 
-            // Count basic blocks: use Javassist's insertAt to add counters.
-            // A simple but effective heuristic: count the method body as 1 basic block,
-            // plus additional blocks estimated from the bytecode length.
-            int codeLength = method.getMethodInfo().getCodeAttribute() != null
-                    ? method.getMethodInfo().getCodeAttribute().getCodeLength() : 0;
-            // Rough estimate: 1 basic block per ~15 bytecode bytes (a common heuristic).
-            long estimatedBlocks = Math.max(1, codeLength / 15);
-            method.insertBefore(
-                    "{ pt.ulisboa.tecnico.cnv.javassist.MetricRegistry.incrementBasicBlocks("
-                            + estimatedBlocks + "L); }");
+        /**
+         * Inserts {@code MetricRegistry.incrementInstructions(N)} at the entry of
+         * every basic block of {@code method}, where {@code N} is the number of
+         * bytecode instructions in that block. Uses {@link ControlFlow} analysis
+         * to identify true basic-block boundaries.
+         *
+         * <p>This is the canonical <b>ICount</b> instrumentation: at runtime the
+         * counter accumulates the total number of instructions executed inside
+         * the workload code, scaled by the dynamic visit count of each block.
+         *
+         * <p>Implementation notes:
+         * <ul>
+         *   <li>Phase 1 walks the bytecode to count instructions per block using
+         *       the <b>original</b> {@link CodeAttribute}. This must happen before
+         *       any byte injection so that block positions remain valid.</li>
+         *   <li>Phase 2 injects payloads in <b>descending position order</b> so
+         *       that the original offsets reported by ControlFlow remain valid
+         *       for the still-unprocessed (lower-offset) blocks.</li>
+         *   <li>{@link CodeIterator#insertAt(int, byte[])} updates branch offsets
+         *       and exception-handler ranges automatically.</li>
+         *   <li>After all insertions the stack-map table is rebuilt
+         *       ({@code rebuildStackMapIf6}); without it Java 7+ class files
+         *       would be rejected by the verifier.</li>
+         * </ul>
+         */
+        private InstrumentationStats instrumentBasicBlocks(CtMethod method) throws Exception {
+            MethodInfo methodInfo = method.getMethodInfo();
+            CodeAttribute codeAttribute = methodInfo.getCodeAttribute();
+            if (codeAttribute == null) return InstrumentationStats.EMPTY;
+
+            Block[] blocks;
+            try {
+                ControlFlow cf = new ControlFlow(method.getDeclaringClass(), methodInfo);
+                blocks = cf.basicBlocks();
+            } catch (Exception e) {
+                // Some pathological methods can't be analysed; skip them gracefully.
+                System.err.println("[JavassistAgent] ControlFlow failed for "
+                        + method.getLongName() + ": " + e.getMessage());
+                return InstrumentationStats.EMPTY;
+            }
+            if (blocks == null || blocks.length == 0) return InstrumentationStats.EMPTY;
+
+            // Phase 1: count instructions per block on the ORIGINAL bytecode.
+            Map<Block, Integer> instructionsPerBlock = new HashMap<>();
+            long totalInstructions = 0;
+            for (Block b : blocks) {
+                int n = countInstructionsInBlock(codeAttribute, b.position(), b.length());
+                instructionsPerBlock.put(b, n);
+                totalInstructions += n;
+            }
+
+            // Phase 2: inject in descending position order so original offsets stay valid
+            //          for the blocks still to be processed.
+            Block[] sorted = blocks.clone();
+            Arrays.sort(sorted, (a, b) -> Integer.compare(b.position(), a.position()));
+
+            CodeIterator ci = codeAttribute.iterator();
+            for (Block b : sorted) {
+                int n = instructionsPerBlock.get(b);
+                if (n <= 0) continue; // defensively skip zero-length blocks
+                // Build payload: ldc2_w/lconst N; invokestatic MetricRegistry.incrementInstructions(J)V
+                // Stack effect: +2 then -2 (long is 2 slots, consumed by invoke).
+                Bytecode bc = new Bytecode(methodInfo.getConstPool());
+                bc.addLconst((long) n);
+                bc.addInvokestatic(METRIC_REGISTRY_INTERNAL,
+                        "incrementInstructions", "(J)V");
+                ci.insertAt(b.position(), bc.get());
+            }
+
+            // Recompute max stack and rebuild stack-map for Java 6/7+ class files.
+            codeAttribute.computeMaxStack();
+            methodInfo.rebuildStackMapIf6(
+                    method.getDeclaringClass().getClassPool(),
+                    method.getDeclaringClass().getClassFile2());
+
+            return new InstrumentationStats(blocks.length, totalInstructions);
+        }
+
+        /**
+         * Counts the number of bytecode instructions inside {@code [start, start+length)}
+         * by walking the (original) bytecode with a fresh {@link CodeIterator}.
+         *
+         * @return number of instructions in the range; minimum 1 to avoid zero counters.
+         */
+        private int countInstructionsInBlock(CodeAttribute codeAttribute, int start, int length)
+                throws BadBytecode {
+            if (length <= 0) return 1;
+            int end = start + length;
+            int count = 0;
+            CodeIterator ci = codeAttribute.iterator();
+            ci.move(start);
+            while (ci.hasNext()) {
+                int pos = ci.next();
+                if (pos >= end) break;
+                count++;
+            }
+            return Math.max(1, count);
         }
     }
 }

@@ -44,11 +44,28 @@ public class AutoScaler {
     private static final long COOLDOWN_MS = 60_000;
 
     /**
-     * Limiar de trabalho estimado por worker (em basic blocks).
-     * ~1 bilião BBs ≈ um pedido médio de fractals (800×800×500).
-     * Acima disto, o AutoScaler adiciona workers.
+     * Limiar de trabalho estimado por worker (em <b>instruções bytecode</b>, ICount).
+     *
+     * <p>Calibração 2026-05-21 baseada em medições empíricas locais (ver
+     * {@code docs/01.6_calibration_evidence.md}):
+     * <ul>
+     *   <li>Fractals 1000×1000×500 (heavy): ~880M instr.</li>
+     *   <li>GrayScott 256×1000 (heavy): ~10.8B instr.</li>
+     *   <li>GrayScott 128×2000 (medium): ~5.4B instr.</li>
+     * </ul>
+     *
+     * <p>Limiar fixado em <b>5×10⁹</b> → scale-up quando avg ≈ 1 pedido medium
+     * por worker. Scale-down em {@code THRESHOLD/4} = 1.25×10⁹ (worker
+     * essencialmente idle, com no máximo 1 pedido leve).
      */
-    private static final long ESTIMATED_WORK_THRESHOLD = 1_000_000_000L;
+    private static final long ESTIMATED_WORK_THRESHOLD = 5_000_000_000L;
+
+    /**
+     * Tempo máximo (em iterações de 2s) que o scale-down espera por drenagem
+     * antes de adiar a terminação. 15 × 2s = 30s de drenagem total.
+     */
+    private static final int DRAIN_POLL_ITERATIONS = 15;
+    private static final long DRAIN_POLL_INTERVAL_MS = 2000;
 
     /**
      * User-data executado pela EC2 worker no primeiro boot.
@@ -261,6 +278,17 @@ public class AutoScaler {
     //  SCALE DOWN
     // ───────────────────────────────────────────────────────────────
 
+    /**
+     * Termina seguramente um worker EC2: drena pedidos em curso ANTES de chamar
+     * {@code terminateInstances}. Se a drenagem não terminar dentro do tempo
+     * máximo, o scale-down é <b>adiado</b> (não há terminação à força) — o
+     * worker é re-adicionado ao pool e o AutoScaler tentará novamente no
+     * próximo ciclo, quando porventura já estiver vazio.
+     *
+     * <p>Esta política substitui a versão anterior (que matava a EC2 mesmo
+     * com {@code activeRequests > 0}, perdendo pedidos a meio). Ver
+     * {@code docs/02.2_safe_scale_down.md}.
+     */
     private void scaleDown() {
         // Escolher worker menos carregado E gerido pelo AutoScaler (com instanceId).
         WorkerPool.Worker target = null;
@@ -275,26 +303,46 @@ public class AutoScaler {
             return;
         }
 
-        System.out.println("[AutoScaler] A drenar e terminar worker: " + target);
+        System.out.println("[AutoScaler] Candidato a scale-down: " + target
+                + " — a iniciar drenagem.");
         workerPool.removeWorker(target); // pára de receber pedidos novos
 
-        // Drenagem: esperar até 30s para pedidos em curso terminarem.
-        for (int i = 0; i < 15 && target.getActiveRequests() > 0; i++) {
-            try { Thread.sleep(2000); } catch (InterruptedException ie) {
+        // Drenagem com polling: aguarda até DRAIN_POLL_ITERATIONS × DRAIN_POLL_INTERVAL_MS.
+        for (int i = 0; i < DRAIN_POLL_ITERATIONS && target.getActiveRequests() > 0; i++) {
+            try {
+                Thread.sleep(DRAIN_POLL_INTERVAL_MS);
+            } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
                 break;
             }
         }
 
+        // Se ainda há pedidos activos: ADIAR (não terminar à força).
+        if (target.getActiveRequests() > 0) {
+            System.out.println("[AutoScaler] Scale-down ADIADO: " + target
+                    + " ainda tem " + target.getActiveRequests()
+                    + " pedidos ativos após " + (DRAIN_POLL_ITERATIONS * DRAIN_POLL_INTERVAL_MS / 1000)
+                    + "s de drenagem. A re-adicionar ao pool — retry no próximo ciclo.");
+            // Re-adicionar para o LB poder voltar a usar o worker entretanto.
+            workerPool.addWorker(target.getHost(), target.getPort(), target.getInstanceId());
+            // NÃO actualizar lastScalingAction: queremos o cooldown a contar do
+            // último scale REAL, não desta tentativa adiada.
+            return;
+        }
+
+        // Drenagem completa — seguro terminar.
         if (awsMode) {
             try {
                 ec2.terminateInstances(new TerminateInstancesRequest()
                         .withInstanceIds(target.getInstanceId()));
-                System.out.println("[AutoScaler] Instância " + target.getInstanceId() + " terminada.");
+                System.out.println("[AutoScaler] Instância " + target.getInstanceId()
+                        + " terminada (drenagem completa).");
             } catch (Exception e) {
                 System.err.println("[AutoScaler] Falha a terminar " + target.getInstanceId()
                         + ": " + e.getMessage());
             }
+        } else {
+            System.out.println("[AutoScaler] (local mode) SCALE DOWN simulado para " + target);
         }
         lastScalingAction = System.currentTimeMillis();
     }

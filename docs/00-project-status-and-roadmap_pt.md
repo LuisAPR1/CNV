@@ -1,8 +1,78 @@
 # Nature@Cloud - Estado do Projeto & Roteiro
 
-> **Última atualização:** 2026-05-19 (sessão 2 — re-validação assistida + 4 fixes)
+> **Última atualização:** 2026-05-22 (sessão 3c — matriz extensiva + correcção de bug + descoberta de saturação)
 > **Autores:** Luis Alexandre + a81430 + laura
 > **Curso:** Computação e Virtualização na Nuvem (CNV) - IST 2025-26
+
+## Resumo da sessão 3c (Luis, 2026-05-22, ronda 2 de calibração com 18 medições adicionais)
+
+Sessão para validar a calibração da ronda anterior e refinar features. Total de 33 medições agora (15 + 18). Descobertas dramáticas que **invalidaram parte da ronda 1**:
+
+**🚨 BUG fix:** o "redutor 1e-4 para `seedMode=corners`" da ronda 1 estava errado — `corners` não é seedMode válido (só `center`/`ring`/`stripe`). O ICount=280k que medi foi o handler a apanhar `IllegalArgumentException`, não comportamento real da simulação. Removida a lógica do `ComplexityEstimator`.
+
+**🎯 Descoberta principal: Julia-set SATURA aos iter=500.** ICount com iter=500, 1000 e 2000 é **idêntico** (140.7M para w=h=400). Acima de 500 itera, todos os pixels que escapam já escaparam. Adicionada constante `FRACTAL_ITER_SATURATION=500` ao `ComplexityEstimator`; feature passa a usar `w·h·min(iter, 500)`.
+
+**🎯 Descoberta secundária: DNA escala LINEAR em `max(seq)`, não quadrático.** 4 medições entre 16 e 500 chars deram `instr/max_seq` entre 123 e 149 (variância <20%, vs >300% com feature antiga). Feature DNA agora é `max(seq1.length(), seq2.length())`; heurística é `× 125`.
+
+**✅ Confirmações fortes (mantidas):**
+- 3 seedModes do GrayScott são **idênticos** em ICount (diff <0.01%) — feature não depende de seedMode.
+- `stopOnExtinction` continua **irrelevante** mesmo com f=0.022/k=0.051 (clássica "death zone"). O threshold de extinção é mais agressivo.
+- `MAX_CAPACITY=5×10¹⁰` validado: `grayscott_s384` deu 48.4B, encaixando exactamente como projectado.
+- Ratio GrayScott = 164 mantém-se de s64 a s384 (3 ordens de grandeza, variância <1%).
+
+**Resumo das mudanças no código (ronda 2):**
+
+| Local | Antes | Depois |
+|---|---|---|
+| Feature fractals | `w·h·iter` | `w·h·min(iter, 500)` |
+| Feature grayscott | `size²·maxIter` + redutor errado para `corners` | `size²·maxIter` (limpo) |
+| Feature dna | `seq1·seq2` | `max(seq1, seq2)` |
+| Heurística fractals | `×6` | piecewise: 10 / 5 / 2 conforme iter (3 regimes empíricos) |
+| Heurística dna | `seqProduct × 10` | `maxSeq × 125` |
+
+Build limpo (`mvn package` exit 0). Constantes de routing/scaling da ronda 1 (`MAX_CAPACITY=5×10¹⁰`, `THRESHOLD=5×10⁹`) mantiveram-se válidas.
+
+**Análise crítica adicional** (no doc 01.6, secção final):
+- **Heurística fractals**: descoberta de 3 regimes empíricos (ramp-up/transição/plateau). Modelo matemático preciso seria `r(iter) = 1.76 + 9.84·exp(-iter/50)` mas usámos piecewise por explicabilidade. Erro do piecewise <15% (vs +184% com multiplicador constante).
+- **Correlação ICount ↔ wall-clock**: medido ~3-5×10⁶ instr/ms. Implica que `MAX_CAPACITY=5×10¹⁰` ≈ 12s de wall-clock e `THRESHOLD=5×10⁹` ≈ 1.2s. Bem acima de SLA típico (100ms) — sistema escala antes do utilizador notar.
+- **Limitações declaradas**: concorrência do `MetricRegistry`, parâmetros inválidos, e variabilidade hardware (t3.micro vs local) ficaram fora do escopo por opção consciente.
+
+**Pendência operacional:**
+- Correr `./scripts/99-cleanup.sh --deep` antes do próximo deploy AWS.
+- Validar em AWS com `_benchmark-extended.sh` contra um worker EC2.
+
+---
+
+## Resumo da sessão 3 (Luis, 2026-05-21, decisões finais de métricas e routing)
+
+Sessão de fundo focada em decidir o conjunto **final** de métricas e a **estratégia** que o LB e o AS usam. 4 mudanças estruturais aplicadas, todas validadas com `mvn package -DskipTests` limpo.
+
+**Mudança 1 — FIX 04 (anterior, mantida): contagem de basic blocks dinâmica.** Problema original: `basicBlockCount` era constante por método (heurística `bytecodeLength/15` injetada à entrada via `insertBefore`). Corrigido com `ControlFlow.basicBlocks()` + injeção por bloco. Doc: `docs/01.4_basicblock_counting_real.md`.
+
+**Mudança 2 — FIX 05: migração para ICount como métrica primária.** Substitui `incrementBasicBlocks(1L)` por `incrementInstructions(N)` onde `N` = nº de instruções bytecode no bloco. Renomeia `basicBlockCount` → `instructionCount` em todo o pipeline (`MetricRegistry`, `MetricsStorageService`, `ComplexityEstimator`). FAQ recomenda explicitamente ICount como ponto de partida. Doc: `docs/01.5_icount_migration.md`.
+
+**Decisão de métricas — três níveis:**
+- **Primária**: `instructionCount` — usada no routing (LB) e scaling (AS).
+- **Secundária**: `methodCallCount` — cross-check / diagnóstico.
+- **Validação**: `elapsedTimeMs` — para verificar correlação com a estimativa, NÃO para decisões.
+
+**Mudança 3 — Routing híbrido (packing + spreading fallback).** O LB passou de spreading puro (`selectLeastLoadedExcluding`) para uma estratégia cost-aware (`WorkerPool.selectForRequest`): pack no worker mais carregado que ainda caiba sob `MAX_CAPACITY`, fall back para least-loaded quando todos os candidatos rebentam o teto. Inspirado nas políticas OpenStack Nova mencionadas no FAQ. Permite consolidar carga e libertar workers idle para scale-down. Doc: `docs/02.1_lb_packing_strategy.md`.
+
+**Mudança 4 — Scale-down seguro.** Bug subtil: o `AutoScaler.scaleDown` matava a EC2 mesmo com `activeRequests > 0` após drenagem, perdendo pedidos a meio. Corrigido para **adiar** a terminação (re-adicionar ao pool, retry no próximo ciclo) quando a drenagem não termina em 30s. Doc: `docs/02.2_safe_scale_down.md`.
+
+**Calibração inicial dos thresholds** (em ICount):
+- `AutoScaler.ESTIMATED_WORK_THRESHOLD = 10¹⁰` (era 10⁹ em BBs).
+- `WorkerPool.DEFAULT_MAX_CAPACITY = 4×10¹¹`.
+- Ambos requerem re-calibração com dados empíricos da nova métrica — a fazer na próxima sessão.
+
+**Status global:** os algoritmos de routing/scaling estão prontos (componentes da Fase 4 do roadmap §9.4). Falta:
+- Validar empiricamente os ratios da nova métrica ICount.
+- Refinar `extractFeature` do GrayScott (ignora `f`, `k`, `stopOnExtinction`).
+- Implementar branch EC2 vs Lambda (Fase 3).
+
+**Pendência operacional:** a tabela `cnv-metrics` no DynamoDB tem ~467 records do esquema antigo (`basicBlockCount`). O estimador ratio-based ignora-os mas continuam a ocupar storage. Recomendado deletar a tabela antes do próximo deployment para fresh start (`aws dynamodb delete-table --table-name cnv-metrics --region eu-west-1`).
+
+---
 
 ## Resumo da sessão 2 (laura, 2026-05-19, validação assistida)
 
@@ -208,11 +278,11 @@ Conforme definido no `Project.txt`, o sistema tem **4 componentes principais**:
 | Componente | Estado | Notas |
 |---|---|---|
 | **WebServer (workers)** | **Validado em AWS** | Multi-threaded (CachedThreadPool), serve fractals/grayscott/dna; corre como systemd `cnv-worker.service` na AMI pré-cozida |
-| **Agente Javassist** | **Validado em AWS** | Instrumenta `pt.ulisboa.tecnico.cnv.{fractals,grayscott,dna}.*` no load time; conta method calls + BBs estimados + elapsed time |
-| **MetricRegistry** | **Validado em AWS** | `CompletedRequest` estruturado, ThreadLocal por pedido, ConcurrentLinkedDeque para histórico in-memory |
-| **MetricsStorageService (DynamoDB)** | **Validado em AWS** | Singleton + escritas assíncronas; auto-cria `cnv-metrics` (PAY_PER_REQUEST) com fix de race condition para scale-up; valida via IMDSv2 |
-| **Balanceador de Carga** | **Validado em AWS** | Least-loaded routing, retry com exclusão, complexity estimate no path; corre via `nohup` em EC2 dedicada |
-| **AutoScaler** | **Validado em AWS** | Scheduler 5s, threshold 1.0/0.25, cooldown 60s, cap 5 workers; lança/termina EC2 via SDK; **scale-up duplo real: 1→3 workers** com 20 pedidos `2000×2000×2000` |
+| **Agente Javassist** | **Validado em AWS** (instrumentação refatorada 2026-05-21) | ICount via `ControlFlow` + injeção por bloco com `N` instruções; métrica primária. Mais: `methodCallCount` (secundária) e `elapsedTimeMs` (validação). |
+| **MetricRegistry** | **Validado em AWS** | `CompletedRequest` estruturado, ThreadLocal por pedido, ConcurrentLinkedDeque para histórico in-memory; campo `instructionCount` é primário |
+| **MetricsStorageService (DynamoDB)** | **Validado em AWS** | Singleton + escritas assíncronas; auto-cria `cnv-metrics` (PAY_PER_REQUEST) com fix de race condition para scale-up; valida via IMDSv2; escreve `instructionCount` (esquema actual) |
+| **Balanceador de Carga** | **Validado em AWS** (routing refatorado 2026-05-21) | Estratégia híbrida packing+spreading (`selectForRequest`), cost-aware via `ComplexityEstimator`; retry com exclusão; corre via `nohup` em EC2 dedicada |
+| **AutoScaler** | **Validado em AWS** (scale-down refatorado 2026-05-21) | Scheduler 5s, threshold ICount 10¹⁰/2.5×10⁹, cooldown 60s, cap 5 workers; **scale-down seguro** com adiamento se drenagem incompleta; scale-up duplo validado anteriormente |
 | **ComplexityEstimator** | **Validado em AWS** | Ratio-based usando histórico DynamoDB (cache 30s) + heuristic fallback; valor escala com `w*h*iter` |
 | **Health checks (WorkerPool)** | **Validado em AWS** | Pings cada 15s a `/`; remove worker após 3 falhas consecutivas; recover automático |
 | **Deployment AWS** | **Validado end-to-end** | 6 scripts bash idempotentes em `scripts/`, AMI worker pré-cozida (Java + JARs + systemd), IAM Roles + Instance Profiles + inline `iam:PassRole` |
@@ -222,9 +292,9 @@ Conforme definido no `Project.txt`, o sistema tem **4 componentes principais**:
 | Componente | Estado | Notas |
 |---|---|---|
 | **Workers Lambda** | **Não iniciado** | Interfaces de handler existem; falta deployment de 3 Lambdas |
-| **Routing por complexidade** | **Parcial** | `Estimate` calculado mas LB ainda não o usa na escolha; só least-loaded |
+| **Routing por complexidade** | **Implementado** (2026-05-21) | `selectForRequest(cost, excluded)` passa o `estimatedCost` do `ComplexityEstimator` ao pool. Falta validação empírica. |
 | **Lambda vs EC2 routing** | **Não iniciado** | Decisão custo/latência por pedido |
-| **Instrumentação real de BBs** | **Limitação conhecida** | Heurística `bytecodeLength/15` aplicada por entrada de método — `basicBlockCount` fica flat quando loops são intra-método (e.g. `JuliaFractal.generate`). Ver secção 5.2 A |
+| **Calibração empírica dos thresholds** | **Pendente** | `MAX_CAPACITY` e `ESTIMATED_WORK_THRESHOLD` foram setados grosseiramente. Re-calibrar com dados reais da métrica ICount após primeira corrida de testes. |
 
 ### Estrutura do projeto
 
@@ -270,11 +340,12 @@ CNV/
 
 ### 5.2 Problemas Que Precisam de Ser Corrigidos
 
-#### A. A Contagem de Blocos Básicos é Imprecisa
+#### A. Contagem de Blocos Básicos — RESOLVIDO em 2026-05-21
 
-A abordagem atual estima blocos básicos como `bytecodeLength / 15`. Esta é uma heurística muito aproximada. Os verdadeiros blocos básicos são delimitados por instruções de salto (if/else, ciclos, switch, try/catch). O Javassist fornece `MethodInfo.getCodeAttribute()` que dá acesso ao bytecode. Deve-se analisar o bytecode para detetar instruções de salto reais (`goto`, `if*`, `tableswitch`, `lookupswitch`, exception handlers) e contar os blocos básicos entre elas.
+> **Histórico** (mantido para contexto do relatório):
+> A abordagem original estimava blocos básicos como `bytecodeLength / 15` aplicada à entrada do método via `insertBefore`. Esta heurística era constante por método — `basicBlockCount` ficava flat quando o trabalho real estava em loops intra-método (caso típico: `JuliaFractal.generate`). Ver `docs/01.4_basicblock_counting_real.md`.
 
-**No entanto**, o enunciado também diz: _"os alunos devem considerar os trade-offs de utilidade/sobrecarga de cada uma e de todas as métricas utilizadas"_. Portanto, uma heurística pode ser aceitável **se for justificada no relatório**. O ponto-chave é que a métrica deve **correlacionar-se bem** com a complexidade real do pedido. Deve-se validar isto executando pedidos com parâmetros diferentes e verificando se os valores das métricas diferem proporcionalmente.
+**Estado actual:** instrumentação real com `ControlFlow.basicBlocks()` + injeção por bloco. Métrica primária migrada para ICount (instruções bytecode acumuladas). Ver `docs/01.5_icount_migration.md`.
 
 #### B. O MetricRegistry Armazena Strings em Vez de Dados Estruturados
 
@@ -316,7 +387,7 @@ O LB precisa da capacidade de invocar funções Lambda como alternativa ao encam
 | # | Requisito | Estado |
 |---|---|---|
 | 1 | Workers VM multi-threaded | **FEITO** (validado em AWS) |
-| 2 | Instrumentação Javassist a recolher métricas | **FEITO** (com limitação conhecida na contagem de BBs — ver 5.2 A) |
+| 2 | Instrumentação Javassist a recolher métricas | **FEITO** (ICount via `ControlFlow` por bloco; `instructionCount` + `methodCallCount` + `elapsedTimeMs`) |
 | 3 | Deploy no AWS EC2 (t3.micro) | **FEITO** (`./04-launch-worker.sh` + AMI pré-cozida com systemd) |
 | 4 | LB configurado na AWS a funcionar | **FEITO** (`./05-launch-lb.sh`, validado com fractais 1000×1000) |
 | 5 | AS configurado na AWS a funcionar | **FEITO** (scale-up duplo real: 1→3 workers com 20 pedidos `2000×2000×2000`) |
@@ -329,9 +400,9 @@ O LB precisa da capacidade de invocar funções Lambda como alternativa ao encam
 
 | # | Requisito | Estado |
 |---|---|---|
-| 1 | Ferramenta de instrumentação balanceando sobrecarga vs. precisão | **NÃO FEITO** |
-| 2 | Algoritmo de auto-scaling (custo + desempenho) | **NÃO FEITO** |
-| 3 | Algoritmo de balanceamento de carga usando estimativas de complexidade do MSS | **NÃO FEITO** |
+| 1 | Ferramenta de instrumentação balanceando sobrecarga vs. precisão | **FEITO** (ICount via CFG; ~1 chamada estática por BB, payload constante) |
+| 2 | Algoritmo de auto-scaling (custo + desempenho) | **PARCIAL** (avgEstimatedWork-based; scale-down seguro com adiamento; falta análise de custo $$$) |
+| 3 | Algoritmo de balanceamento de carga usando estimativas de complexidade do MSS | **FEITO** (`selectForRequest` híbrido packing+spreading, cost-aware) |
 | 4 | Suporte a workers Lambda (FaaS) | **NÃO FEITO** |
 | 5 | Balanceamento EC2 + Lambda (custo vs. latência) | **NÃO FEITO** |
 | 6 | Automação completa de deployment | **NÃO FEITO** |

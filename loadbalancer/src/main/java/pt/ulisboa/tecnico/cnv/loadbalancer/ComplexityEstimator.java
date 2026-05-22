@@ -14,14 +14,23 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Estima a complexidade (contagem prevista de basic blocks) de um pedido
+ * Estima a complexidade (contagem prevista de instruções bytecode) de um pedido
  * antes de este ser encaminhado para um worker.
  *
- * Estratégia em 2 camadas:
- *   1. Histórico do DynamoDB (MSS): usa ratio-based estimation com dados passados.
- *   2. Heurísticas de fallback: fórmulas baseadas nos parâmetros do pedido.
+ * <p>A unidade da estimativa é <b>instruções bytecode executadas</b> dentro do
+ * código instrumentado dos workloads (ICount), correspondente ao campo
+ * {@code instructionCount} na tabela DynamoDB. Esta é a métrica primária
+ * recolhida pelo {@code JavassistAgent}.
  *
- * Os resultados do DynamoDB são cacheados em memória (30s TTL) para evitar
+ * <p>Estratégia em 2 camadas:
+ * <ol>
+ *   <li><b>Histórico do DynamoDB (MSS)</b>: ratio-based estimation
+ *       (regressão linear simples) com pedidos passados do mesmo tipo.</li>
+ *   <li><b>Heurísticas de fallback</b>: fórmulas baseadas nos parâmetros
+ *       quando não há histórico ou o DynamoDB está indisponível.</li>
+ * </ol>
+ *
+ * <p>Os resultados do DynamoDB são cacheados em memória (30s TTL) para evitar
  * que o MSS se torne um gargalo, como avisado no enunciado.
  */
 public class ComplexityEstimator {
@@ -56,11 +65,11 @@ public class ComplexityEstimator {
 
     private static class HistoricalRecord {
         final Map<String, String> parameters;
-        final long basicBlockCount;
+        final long instructionCount;
 
-        HistoricalRecord(Map<String, String> parameters, long basicBlockCount) {
+        HistoricalRecord(Map<String, String> parameters, long instructionCount) {
             this.parameters = parameters;
-            this.basicBlockCount = basicBlockCount;
+            this.instructionCount = instructionCount;
         }
     }
 
@@ -69,23 +78,23 @@ public class ComplexityEstimator {
     // ─────────────────────────────────────────────────────────────
 
     public static class Estimate {
-        private final long estimatedBasicBlocks;
+        private final long estimatedCost;
         private final String source;
 
-        public Estimate(long estimatedBasicBlocks, String source) {
-            this.estimatedBasicBlocks = estimatedBasicBlocks;
+        public Estimate(long estimatedCost, String source) {
+            this.estimatedCost = estimatedCost;
             this.source = source;
         }
 
-        /** Custo estimado em basic blocks. */
-        public long getEstimatedBasicBlocks() { return estimatedBasicBlocks; }
+        /** Custo estimado, em instruções bytecode (ICount). */
+        public long getEstimatedCost() { return estimatedCost; }
 
         /** Origem da estimativa: "history" ou "heuristic". */
         public String getSource() { return source; }
 
         @Override
         public String toString() {
-            return String.format("cost=%d (%s)", estimatedBasicBlocks, source);
+            return String.format("cost=%d (%s)", estimatedCost, source);
         }
     }
 
@@ -138,11 +147,15 @@ public class ComplexityEstimator {
 
     /**
      * Modelo ratio-based:
-     *   1. Para cada pedido histórico, calcula ratio = basicBlockCount / feature
+     *   1. Para cada pedido histórico, calcula ratio = instructionCount / feature
      *   2. Calcula média dos ratios
      *   3. Estimativa = avgRatio × feature_do_novo_pedido
      *
-     * Isto é equivalente a uma regressão linear simples: basicBlocks = k × feature
+     * Isto é equivalente a uma regressão linear simples: cost = k × feature
+     *
+     * Registos do histórico com {@code instructionCount == 0} são saltados
+     * (e.g. dados legacy do esquema antigo "basicBlockCount", ou pedidos onde
+     * o agente Javassist não correu).
      */
     private long estimateFromHistory(String requestType, Map<String, String> parameters) {
         List<HistoricalRecord> history = getHistory(requestType);
@@ -155,8 +168,8 @@ public class ComplexityEstimator {
         int count = 0;
         for (HistoricalRecord rec : history) {
             double featureHist = extractFeature(requestType, rec.parameters);
-            if (featureHist > 0 && rec.basicBlockCount > 0) {
-                sumRatios += (double) rec.basicBlockCount / featureHist;
+            if (featureHist > 0 && rec.instructionCount > 0) {
+                sumRatios += (double) rec.instructionCount / featureHist;
                 count++;
             }
         }
@@ -171,38 +184,54 @@ public class ComplexityEstimator {
     // ─────────────────────────────────────────────────────────────
 
     /**
+     * Cap para o parâmetro {@code iterations} dos fractals.
+     * <p>Medições empíricas (2026-05-21, matriz extensiva, ver
+     * {@code docs/01.6_calibration_evidence.md}) demonstram que o Julia-set
+     * c=(-0.7, 0.6) <b>satura aos ~500 iterações</b>: ICount com iter=500,
+     * 1000 ou 2000 é <em>idêntico</em> (140.7M para w=h=400). Todos os pixels
+     * que vão escapar já escaparam, e os do "interior" do set continuam até
+     * iter, mas são uma fração pequena do trabalho total.
+     */
+    private static final long FRACTAL_ITER_SATURATION = 500L;
+
+    /**
      * Extrai uma feature numérica dos parâmetros que se correlaciona com a complexidade.
      * A feature é usada tanto para estimar como para calcular ratios do histórico.
+     *
+     * <p>Calibrado com 33 medições (15 + 18) em 2026-05-21.
+     * Ver {@code docs/01.6_calibration_evidence.md} para a análise completa.
      */
     private double extractFeature(String requestType, Map<String, String> parameters) {
         switch (requestType) {
             case "fractals": {
                 // Cada pixel corre o loop de iteração da Julia set.
+                // CAP iter aos 500 — acima disto, ICount não muda (Julia-set
+                // satura, pixels que vão escapar já escaparam).
                 double w = parseDouble(parameters, "w", 800);
                 double h = parseDouble(parameters, "h", 600);
                 double iter = parseDouble(parameters, "iterations", 100);
-                return w * h * iter;
+                double effIter = Math.min(iter, (double) FRACTAL_ITER_SATURATION);
+                return w * h * effIter;
             }
             case "grayscott": {
                 // Grid NxN onde cada célula é atualizada em cada iteração.
+                // Validado empiricamente: ratio 164 instr/cell-iter constante
+                // para qualquer dos 3 seedModes válidos (center/ring/stripe
+                // tiveram ICount com diferença <0.01% no mesmo size/maxIter).
+                // stopOnExtinction também não teve efeito mensurável (mesmo na
+                // "death zone" f=0.022/k=0.051 a extinção não disparou).
                 double size = parseDouble(parameters, "size", 256);
                 double maxIter = parseDouble(parameters, "maxIterations", 5000);
                 return size * size * maxIter;
             }
             case "dna": {
-                // Complexidade proporcional ao tamanho das sequências,
-                // inversamente proporcional ao minLength.
-                // seq1/seq2 vêm como "name:content" — o comprimento do parâmetro
-                // é um proxy razoável para o comprimento da sequência.
-                double minLen = parseDouble(parameters, "minLength", 1);
-                if (minLen < 1) minLen = 1;
+                // Trabalho ~linear no comprimento da sequência MAIOR (não no
+                // produto): 4 medições entre 16 e 500 chars deram
+                // instr/max(seq1,seq2) entre 123 e 149 (variância <20%).
+                // minLength e stopOnFirst não tiveram efeito mensurável.
                 String seq1 = parameters.getOrDefault("seq1", "");
                 String seq2 = parameters.getOrDefault("seq2", "");
-                double seqFactor = Math.max(1, (double) seq1.length() * seq2.length());
-                boolean stopOnFirst = "true".equalsIgnoreCase(parameters.getOrDefault("stopOnFirst", "false"));
-                // stopOnFirst reduz significativamente o trabalho (fator ~0.3)
-                double stopFactor = stopOnFirst ? 0.3 : 1.0;
-                return (seqFactor / minLen) * stopFactor;
+                return Math.max(1, (double) Math.max(seq1.length(), seq2.length()));
             }
             default:
                 return 1.0;
@@ -215,7 +244,21 @@ public class ComplexityEstimator {
 
     /**
      * Estimativa puramente baseada nos parâmetros, sem dados históricos.
-     * Os multiplicadores são calibráveis — serão afinados quando houver dados reais.
+     * Os multiplicadores convertem a feature ("unidades de trabalho lógico")
+     * em <b>instruções bytecode</b> esperadas.
+     *
+     * <p>Calibração 2026-05-21 baseada em 33 medições empíricas observadas
+     * localmente (ver {@code docs/01.6_calibration_evidence.md}):
+     * <ul>
+     *   <li><b>fractals</b>: ratio depende fortemente de iter (Julia-set tem
+     *       3 regimes: ramp-up iter&lt;100, transição 100-300, plateau iter≥300).
+     *       Heurística usa multiplicador piecewise para cobrir os 3.</li>
+     *   <li><b>grayscott</b>: ratio = 164 instr/(célula·iter) com variância
+     *       &lt;1% (confirmado em 11 medições cobrindo s64 a s384,
+     *       3 seedModes, e f/k diferentes).</li>
+     *   <li><b>dna</b>: linear em max(seq1.length, seq2.length) com ratio
+     *       ~125 instr/char (variância &lt;20% em 4 medições entre 16 e 500 chars).</li>
+     * </ul>
      */
     private long estimateFromHeuristics(String requestType, Map<String, String> parameters) {
         switch (requestType) {
@@ -223,24 +266,35 @@ public class ComplexityEstimator {
                 long w = parseLong(parameters, "w", 800);
                 long h = parseLong(parameters, "h", 600);
                 long iter = parseLong(parameters, "iterations", 100);
-                // ~10 BBs estimados por pixel-iteração (calibrável)
-                return w * h * iter * 10;
+                // CAP iter aos 500 (Julia-set satura, ver constante FRACTAL_ITER_SATURATION).
+                long effIter = Math.min(iter, FRACTAL_ITER_SATURATION);
+                // Multiplicador piecewise (3 regimes empíricos):
+                //   - iter ≤ 100: ratio observado ~11 (ramp-up: pixels do bordo ainda crescem com iter)
+                //   - 100 < iter ≤ 300: ratio observado ~5 (transição: maioria dos pixels já escapou)
+                //   - iter > 300: ratio observado ~2 (plateau: trabalho saturado)
+                long multiplier;
+                if (iter <= 100) {
+                    multiplier = 10;
+                } else if (iter <= 300) {
+                    multiplier = 5;
+                } else {
+                    multiplier = 2;
+                }
+                return w * h * effIter * multiplier;
             }
             case "grayscott": {
                 long size = parseLong(parameters, "size", 256);
                 long maxIter = parseLong(parameters, "maxIterations", 5000);
-                // ~5 BBs estimados por célula-iteração (calibrável)
-                return size * size * maxIter * 5;
+                // Ratio empírico extremamente estável: 164 instr/(célula·iter)
+                // independente de seedMode e f/k.
+                return size * size * maxIter * 164;
             }
             case "dna": {
-                long minLen = parseLong(parameters, "minLength", 1);
-                if (minLen < 1) minLen = 1;
                 String seq1 = parameters.getOrDefault("seq1", "");
                 String seq2 = parameters.getOrDefault("seq2", "");
-                long seqProduct = Math.max(1, (long) seq1.length() * seq2.length());
-                boolean stopOnFirst = "true".equalsIgnoreCase(parameters.getOrDefault("stopOnFirst", "false"));
-                long base = seqProduct / minLen;
-                return Math.max(1000, stopOnFirst ? base / 3 : base);
+                long maxSeq = Math.max(1, (long) Math.max(seq1.length(), seq2.length()));
+                // Ratio empírico: ~125 instr/char da sequência maior.
+                return Math.max(1000, maxSeq * 125);
             }
             default:
                 return 10000;
@@ -276,17 +330,20 @@ public class ComplexityEstimator {
             List<HistoricalRecord> records = new ArrayList<>();
             for (Map<String, AttributeValue> item : result.getItems()) {
                 Map<String, String> params = new HashMap<>();
-                long bbc = 0;
+                long ic = 0;
 
                 for (Map.Entry<String, AttributeValue> entry : item.entrySet()) {
                     if (entry.getKey().startsWith("param_") && entry.getValue().getS() != null) {
                         params.put(entry.getKey().substring(6), entry.getValue().getS());
                     }
-                    if ("basicBlockCount".equals(entry.getKey()) && entry.getValue().getN() != null) {
-                        bbc = Long.parseLong(entry.getValue().getN());
+                    // Campo primário: instructionCount (ICount).
+                    // Registos do esquema antigo (apenas com basicBlockCount) ficam com ic=0
+                    // e são deliberadamente filtrados pelo estimador ratio-based.
+                    if ("instructionCount".equals(entry.getKey()) && entry.getValue().getN() != null) {
+                        ic = Long.parseLong(entry.getValue().getN());
                     }
                 }
-                records.add(new HistoricalRecord(params, bbc));
+                records.add(new HistoricalRecord(params, ic));
             }
 
             CachedHistory newCache = new CachedHistory(records);

@@ -92,17 +92,20 @@ public class LoadBalancer {
             String requestType = path.substring(1); // remove leading /
             Map<String, String> params = parseQuery(query);
             ComplexityEstimator.Estimate estimate = complexityEstimator.estimate(requestType, params);
-            long estimatedCost = estimate.getEstimatedBasicBlocks();
+            long estimatedCost = estimate.getEstimatedCost();
             System.out.println("[LoadBalancer] Complexity estimate for " + path + ": " + estimate);
 
-            // Try forwarding with retry on failure.
+            // Try forwarding with retry on failure. Hybrid placement strategy:
+            // packing within MAX_CAPACITY, spreading as fallback. See
+            // docs/02.1_lb_packing_strategy.md for the rationale.
             int maxRetries = Math.min(3, workerPool.size());
             java.util.Set<WorkerPool.Worker> triedWorkers = new java.util.HashSet<>();
             boolean success = false;
 
             for (int attempt = 0; attempt < maxRetries && !success; attempt++) {
-                // Select least-loaded worker not yet tried (uses estimatedWork).
-                WorkerPool.Worker worker = workerPool.selectLeastLoadedExcluding(triedWorkers);
+                // Cost-aware hybrid selection (packing/spreading) excluding workers
+                // already tried in previous attempts.
+                WorkerPool.Worker worker = workerPool.selectForRequest(estimatedCost, triedWorkers);
                 if (worker == null) {
                     break;
                 }
