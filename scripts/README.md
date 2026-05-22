@@ -1,86 +1,119 @@
 # Scripts de provisionamento AWS — Nature@Cloud
 
 Scripts **bash** (`.sh`) que automatizam todo o ciclo de vida da infra AWS
-do projecto. Portáveis: corre em Linux, macOS, ou Windows (Git Bash / WSL).
-
-Os 5 scripts numerados seguem exactamente o que está no roadmap §9.2.1:
-`setup-security-group` → `02-setup-network.sh`, `create-ami` →
-`03-create-ami.sh`, `launch-worker` → `04`, `launch-lb` → `05`,
-`cleanup` → `99`. O `01-setup-iam.sh` é adicional (necessário para os
-`--iam-instance-profile` dos restantes scripts funcionarem).
+do projecto. Correm em Linux, macOS, ou Windows (WSL).
 
 ---
 
 ## Pré-requisitos
 
 1. **AWS CLI v2** → `aws --version`
-2. **Credenciais configuradas** → `aws configure` (IAM user, nunca root)
-3. **bash + curl + ssh + scp** (em Windows: Git Bash já tem)
-4. **Java 11 + Maven** para fazer `mvn package` antes da AMI
+2. **Credenciais configuradas** → `aws configure` (IAM user)
+3. **bash + curl + ssh + scp**
+4. **Java 11 + Maven** para `mvn package` antes da AMI
 
 Validar:
 ```bash
 aws sts get-caller-identity
 ```
 
+### ⚠️ WSL (Windows)
+
+Em WSL, `chmod` **não funciona** em paths `/mnt/c/...` (Windows FS).
+A key pair é guardada em `~/.ssh/cnv-keypair.pem` (Linux FS).
+Ver `aws-config.sh:41`.
+
 ---
 
-## Ordem de execução (primeira vez, ~10 minutos)
+## Pipeline completa (~12 minutos)
 
 ```bash
-chmod +x scripts/*.sh   # Linux/Mac apenas
-
 cd scripts
 
-./01-setup-iam.sh        # 3 IAM Roles + 2 Instance Profiles
-./02-setup-network.sh    # 2 Security Groups + SSH key pair
+# 0. (Opcional) Apagar tudo de sessões anteriores
+echo "YES" | ./99-cleanup.sh --deep
 
-# Build dos JARs (necessário antes da AMI)
+# 1. IAM: 3 Roles + 2 Instance Profiles
+./01-setup-iam.sh
+
+# 2. Network: key pair + 2 Security Groups (worker + LB)
+./02-setup-network.sh
+
+# 3. Build dos JARs (na raiz do projecto)
 cd .. && mvn clean package -DskipTests && cd scripts
 
-./03-create-ami.sh       # Cria AMI worker (~5 min: lança VM, instala Java, copia JAR, snapshot, termina VM)
+# 4. AMI (~5 min): worker image com Java 11 + JARs + systemd
+./03-create-ami.sh
+
+# 5. Lançar worker
+./04-launch-worker.sh
+
+# 6. Lançar Load Balancer
+./05-launch-lb.sh $(cat .state/worker-instance-ids.txt)
 ```
 
-A tabela DynamoDB **não tem script próprio** — é criada automaticamente
-pelo `MetricsStorageService` no arranque da aplicação Java.
+A tabela DynamoDB é criada automaticamente pelo `MetricsStorageService`
+no primeiro pedido.
 
 ---
 
-## Workflow de cada sessão de trabalho
+## Sessão de trabalho (código não mudou)
 
 ```bash
 cd scripts
-
-./04-launch-worker.sh    # Lança 1 worker a partir da AMI (auto-start via systemd)
-./05-launch-lb.sh        # Lança o LB e fá-lo apontar para esta AMI no AutoScaler
-
-# ... testes com curl ...
-
-./99-cleanup.sh          # Termina TODAS as EC2s do projecto (preserva infra)
+./04-launch-worker.sh
+./05-launch-lb.sh $(cat .state/worker-instance-ids.txt)
+# ... testes ...
+./99-cleanup.sh
 ```
 
-No fim do projecto:
+Se o código mudou, recriar a AMI primeiro:
 ```bash
-./99-cleanup.sh --deep   # Apaga TUDO (pede confirmação "YES")
+cd .. && mvn clean package -DskipTests && cd scripts
+./03-create-ami.sh
 ```
 
 ---
 
-## Ficheiros gerados (não vão para git)
+## Cleanup
 
-- `cnv-keypair.pem` — chave SSH privada (`.gitignore` bloqueia)
-- `.state/*.txt` — IDs dos recursos criados (usados por outros scripts e pelo cleanup)
+```bash
+./99-cleanup.sh              # Só EC2s (preserva AMI, SGs, IAM)
+echo "YES" | ./99-cleanup.sh --deep   # TUDO
+```
 
 ---
 
-## Configuração
+## Scripts de teste (`test/`)
 
-Tudo em `aws-config.sh`. Para mudar de região:
+| Script | Descrição |
+|---|---|
+| `_benchmark-icount.sh` | Mede instruction count localmente |
+| `_benchmark-dna.sh` | Mede DNA localmente |
+| `_check-state.sh` | Estado dos recursos AWS |
+| `_collect-logs.sh` | Recolhe logs dos workers e LB |
+| `_diagnose-orphans.sh` | Recursos órfãos do projecto |
 
+---
+
+## Ficheiros gerados (.gitignore)
+
+| Ficheiro | Descrição |
+|---|---|
+| `~/.ssh/cnv-keypair.pem` | Chave SSH privada (Linux FS, 400) |
+| `.state/worker-ami-id.txt` | AMI ID |
+| `.state/worker-sg-id.txt` | SG worker |
+| `.state/lb-sg-id.txt` | SG LB |
+| `.state/worker-instance-ids.txt` | Worker IDs |
+| `.state/lb-instance-id.txt` | LB ID |
+
+---
+
+## Configuração (`aws-config.sh`)
+
+Para mudar de região:
 ```bash
 export AWS_REGION=us-east-1
-# Também tens de actualizar BASE_AMI_ID — descobrir o AMI Amazon Linux 2023
-# na nova região com:
 aws ec2 describe-images --owners amazon \
     --filters "Name=name,Values=al2023-ami-2023.*-x86_64" \
     --query "sort_by(Images,&CreationDate)[-1].ImageId" \
@@ -89,14 +122,14 @@ aws ec2 describe-images --owners amazon \
 
 ---
 
-## Validação (Níveis 1–7)
+## Validação
 
 | # | Comando | Prova |
 |---|---|---|
-| 1 | `aws sts get-caller-identity` | Credenciais OK |
+| 1 | `aws sts get-caller-identity` | Credenciais |
 | 2 | `aws ec2 describe-regions` | Permissões EC2 |
-| 3 | (programa Java de teste) | SDK Java lê credenciais |
-| 4 | `aws dynamodb list-tables` | DynamoDB acessível |
-| 5 | `./04-launch-worker.sh` + `curl` | EC2 + SG + key pair |
-| 6 | dentro EC2: `aws sts get-caller-identity --region eu-west-1` (Arn deve terminar em `assumed-role/CNV-Worker-Role/i-...`) | Instance Profile entrega credenciais (IMDSv2) |
-| 7 | LB + worker + `aws dynamodb scan --table-name cnv-metrics` | End-to-end |
+| 3 | Programa Java de teste | SDK Java |
+| 4 | `aws dynamodb list-tables` | DynamoDB |
+| 5 | `./04-launch-worker.sh` + `curl` | EC2 + SG + key |
+| 6 | `aws sts get-caller-identity` dentro EC2 | Instance Profile |
+| 7 | LB + worker + `aws dynamodb scan` | End-to-end |

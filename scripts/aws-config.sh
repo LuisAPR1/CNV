@@ -37,7 +37,8 @@ export STATE_DIR="$SCRIPT_DIR/.state"
 mkdir -p "$STATE_DIR"
 
 # --- Ficheiros de output ---
-export KEYPAIR_FILE="$SCRIPT_DIR/$KEYPAIR_NAME.pem"
+# Store key in WSL home (chmod works on Linux FS, not on /mnt/c)
+export KEYPAIR_FILE="$HOME/.ssh/$KEYPAIR_NAME.pem"
 export WORKER_SG_ID_FILE="$STATE_DIR/worker-sg-id.txt"
 export LB_SG_ID_FILE="$STATE_DIR/lb-sg-id.txt"
 export WORKER_AMI_ID_FILE="$STATE_DIR/worker-ami-id.txt"

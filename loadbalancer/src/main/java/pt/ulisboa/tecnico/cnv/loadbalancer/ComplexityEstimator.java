@@ -38,9 +38,11 @@ public class ComplexityEstimator {
     private static final String TABLE_NAME = "cnv-metrics";
     private static final long CACHE_TTL_MS = 30_000;
     private static final int MAX_HISTORY_RECORDS = 50;
+    private static final long DYNAMODB_RETRY_INTERVAL_MS = 60_000;
 
     private AmazonDynamoDB dynamoDB;
     private boolean available = false;
+    private long lastRetryAttemptMs = 0;
 
     /** Cache local: requestType → histórico recente. */
     private final ConcurrentHashMap<String, CachedHistory> cache = new ConcurrentHashMap<>();
@@ -103,14 +105,36 @@ public class ComplexityEstimator {
     // ─────────────────────────────────────────────────────────────
 
     public ComplexityEstimator() {
+        tryConnect();
+    }
+
+    /**
+     * Tenta estabelecer ligação ao DynamoDB. Se falhar, agenda retry.
+     */
+    private void tryConnect() {
+        this.lastRetryAttemptMs = System.currentTimeMillis();
         try {
-            this.dynamoDB = AmazonDynamoDBClientBuilder.defaultClient();
+            if (this.dynamoDB == null) {
+                this.dynamoDB = AmazonDynamoDBClientBuilder.defaultClient();
+            }
             dynamoDB.describeTable(TABLE_NAME);
             this.available = true;
             System.out.println("[ComplexityEstimator] DynamoDB disponível. A usar dados históricos.");
         } catch (Exception e) {
+            this.available = false;
             System.err.println("[ComplexityEstimator] DynamoDB indisponível: " + e.getMessage());
-            System.err.println("[ComplexityEstimator] A usar apenas heurísticas baseadas em parâmetros.");
+            System.err.println("[ComplexityEstimator] A usar apenas heurísticas. Retry em "
+                + (DYNAMODB_RETRY_INTERVAL_MS / 1000) + "s.");
+        }
+    }
+
+    /**
+     * Se o DynamoDB não está disponível e já passou o intervalo de retry,
+     * tenta reconectar. Chamado em cada {@link #estimate}.
+     */
+    private void retryIfNeeded() {
+        if (!available && System.currentTimeMillis() - lastRetryAttemptMs > DYNAMODB_RETRY_INTERVAL_MS) {
+            tryConnect();
         }
     }
 
@@ -126,6 +150,9 @@ public class ComplexityEstimator {
      * @return estimativa com custo previsto e fonte
      */
     public Estimate estimate(String requestType, Map<String, String> parameters) {
+        // Retry ao DynamoDB se necessário (não bloqueia — tenta 1× a cada 60s).
+        retryIfNeeded();
+
         // Tentar estimativa baseada no histórico DynamoDB.
         if (available) {
             long historyEstimate = estimateFromHistory(requestType, parameters);
