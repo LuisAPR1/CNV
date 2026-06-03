@@ -16,6 +16,12 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.Executors;
 
+import com.amazonaws.services.lambda.AWSLambda;
+import com.amazonaws.services.lambda.AWSLambdaClientBuilder;
+import com.amazonaws.services.lambda.model.InvokeRequest;
+import com.amazonaws.services.lambda.model.InvokeResult;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
 /**
  * Load Balancer — entry point of the Nature@Cloud system.
  * Receives all HTTP requests and forwards them to available workers.
@@ -35,10 +41,16 @@ public class LoadBalancer {
     private final AutoScaler autoScaler;
     private final ComplexityEstimator complexityEstimator;
 
+    private static final long LAMBDA_COST_THRESHOLD = 2_000_000_000L;
+    private final AWSLambda lambdaClient;
+    private final ObjectMapper objectMapper;
+
     public LoadBalancer(WorkerPool workerPool) {
         this.workerPool = workerPool;
         this.autoScaler = new AutoScaler(workerPool);
         this.complexityEstimator = new ComplexityEstimator();
+        this.lambdaClient = AWSLambdaClientBuilder.defaultClient();
+        this.objectMapper = new ObjectMapper();
     }
 
     public void start(int port) throws IOException {
@@ -94,6 +106,46 @@ public class LoadBalancer {
             ComplexityEstimator.Estimate estimate = complexityEstimator.estimate(requestType, params);
             long estimatedCost = estimate.getEstimatedCost();
             System.out.println("[LoadBalancer] Complexity estimate for " + path + ": " + estimate);
+
+            // Cost-based routing decision
+            if (estimatedCost < LAMBDA_COST_THRESHOLD) {
+                System.out.println("[LoadBalancer] Forwarding " + path + " -> AWS Lambda (Cost: " + estimatedCost + ")");
+                try {
+                    String payload = objectMapper.writeValueAsString(params);
+                    InvokeRequest invokeRequest = new InvokeRequest()
+                            .withFunctionName(requestType)
+                            .withPayload(payload);
+                    InvokeResult invokeResult = lambdaClient.invoke(invokeRequest);
+
+                    byte[] responsePayload = invokeResult.getPayload().array();
+                    String resultString = new String(responsePayload, java.nio.charset.StandardCharsets.UTF_8);
+                    
+                    // AWS Lambda Java Core serializes `String` return type as a JSON string literal.
+                    // We need to unescape it so it returns raw HTML/text to the client.
+                    if (resultString.startsWith("\"") && resultString.endsWith("\"")) {
+                        try {
+                            resultString = objectMapper.readValue(resultString, String.class);
+                        } catch (Exception ignored) {}
+                    }
+                    byte[] finalBody = resultString.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                    
+                    int statusCode = invokeResult.getStatusCode() != null ? invokeResult.getStatusCode() : 200;
+                    if (invokeResult.getFunctionError() != null) {
+                        statusCode = 500;
+                        System.err.println("[LoadBalancer] Lambda error: " + invokeResult.getFunctionError());
+                    }
+                    
+                    exchange.sendResponseHeaders(statusCode, finalBody.length);
+                    OutputStream os = exchange.getResponseBody();
+                    os.write(finalBody);
+                    os.close();
+                    return;
+                } catch (Exception e) {
+                    System.err.println("[LoadBalancer] Lambda execution failed: " + e.getMessage());
+                    e.printStackTrace();
+                    System.out.println("[LoadBalancer] Fallback to EC2 worker for " + path);
+                }
+            }
 
             // Try forwarding with retry on failure. Hybrid placement strategy:
             // packing within MAX_CAPACITY, spreading as fallback. See
