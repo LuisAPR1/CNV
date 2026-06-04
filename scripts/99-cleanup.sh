@@ -103,7 +103,14 @@ remove_role "$LB_ROLE_NAME"     "true"
 remove_role "$WORKER_ROLE_NAME" "true"
 remove_role "$LAMBDA_ROLE_NAME" "false"
 
-# --- 6) DynamoDB ---
+# --- 6) Lambda functions ---
+for fn in cnv-fractals cnv-grayscott cnv-dna; do
+    aws lambda delete-function --function-name "$fn" --region "$AWS_REGION" 2>/dev/null \
+        && ok "Lambda '$fn' apagada." || true
+done
+rm -f "$STATE_DIR/lambda-role-arn.txt"
+
+# --- 7) DynamoDB ---
 aws dynamodb delete-table --table-name "$DYNAMO_TABLE_NAME" --region "$AWS_REGION" 2>/dev/null \
     && ok "Tabela DynamoDB apagada." || warn "Falha a apagar tabela DynamoDB."
 

@@ -1,11 +1,14 @@
 package pt.ulisboa.tecnico.cnv.javassist;
 
+import java.lang.management.ManagementFactory;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentLinkedDeque;
+
+import com.sun.management.ThreadMXBean;
 
 /**
  * Thread-local metric collection for instrumented request handling.
@@ -24,16 +27,18 @@ public class MetricRegistry {
         private final Map<String, String> parameters;
         private final long methodCallCount;
         private final long instructionCount;
+        private final long allocatedBytes;
         private final long elapsedTimeMs;
         private final long timestamp;
 
         public CompletedRequest(String requestType, Map<String, String> parameters,
                                 long methodCallCount, long instructionCount,
-                                long elapsedTimeMs, long timestamp) {
+                                long allocatedBytes, long elapsedTimeMs, long timestamp) {
             this.requestType = requestType;
             this.parameters = Collections.unmodifiableMap(new HashMap<>(parameters));
             this.methodCallCount = methodCallCount;
             this.instructionCount = instructionCount;
+            this.allocatedBytes = allocatedBytes;
             this.elapsedTimeMs = elapsedTimeMs;
             this.timestamp = timestamp;
         }
@@ -41,8 +46,10 @@ public class MetricRegistry {
         public String getRequestType() { return requestType; }
         public Map<String, String> getParameters() { return parameters; }
         public long getMethodCallCount() { return methodCallCount; }
-        /** Bytecode instructions executed inside the instrumented packages (primary metric). */
+        /** Bytecode instructions executed inside the instrumented packages (CPU metric). */
         public long getInstructionCount() { return instructionCount; }
+        /** Bytes allocated by this thread during request processing (RAM metric). */
+        public long getAllocatedBytes() { return allocatedBytes; }
         public long getElapsedTimeMs() { return elapsedTimeMs; }
         public long getTimestamp() { return timestamp; }
 
@@ -55,6 +62,7 @@ public class MetricRegistry {
             map.put("requestType", requestType);
             map.put("methodCallCount", String.valueOf(methodCallCount));
             map.put("instructionCount", String.valueOf(instructionCount));
+            map.put("allocatedBytes", String.valueOf(allocatedBytes));
             map.put("elapsedTimeMs", String.valueOf(elapsedTimeMs));
             map.put("timestamp", String.valueOf(timestamp));
             for (Map.Entry<String, String> entry : parameters.entrySet()) {
@@ -65,8 +73,8 @@ public class MetricRegistry {
 
         @Override
         public String toString() {
-            return String.format("[%s] params=%s, methods=%d, instructions=%d, time=%dms",
-                    requestType, parameters, methodCallCount, instructionCount, elapsedTimeMs);
+            return String.format("[%s] params=%s, methods=%d, instructions=%d, alloc=%dB, time=%dms",
+                    requestType, parameters, methodCallCount, instructionCount, allocatedBytes, elapsedTimeMs);
         }
     }
 
@@ -77,6 +85,7 @@ public class MetricRegistry {
     public static class RequestMetrics {
         private long methodCallCount = 0;
         private long instructionCount = 0;
+        private long allocatedBytesBefore = 0;
         private long startTime = 0;
         private String requestType = "";
         private Map<String, String> parameters = new HashMap<>();
@@ -91,7 +100,18 @@ public class MetricRegistry {
             this.methodCallCount = 0;
             this.instructionCount = 0;
             this.startTime = System.nanoTime();
+            this.allocatedBytesBefore = getAllocatedBytesNow();
             parseUri(uri);
+        }
+
+        private static long getAllocatedBytesNow() {
+            try {
+                ThreadMXBean tmxb = (ThreadMXBean) ManagementFactory.getThreadMXBean();
+                if (tmxb.isThreadAllocatedMemorySupported() && tmxb.isThreadAllocatedMemoryEnabled()) {
+                    return tmxb.getThreadAllocatedBytes(Thread.currentThread().getId());
+                }
+            } catch (Exception ignored) {}
+            return -1;
         }
 
         private void parseUri(String uri) {
@@ -131,6 +151,14 @@ public class MetricRegistry {
         public Map<String, String> getParameters() { return parameters; }
         public long getElapsedTimeMs() { return (System.nanoTime() - startTime) / 1_000_000; }
 
+        /** Bytes allocated by this thread during request processing. -1 if unavailable. */
+        public long getAllocatedBytes() {
+            if (allocatedBytesBefore < 0) return -1;
+            long now = getAllocatedBytesNow();
+            if (now < 0) return -1;
+            return now - allocatedBytesBefore;
+        }
+
         /**
          * Creates an immutable snapshot of the current metrics.
          */
@@ -140,6 +168,7 @@ public class MetricRegistry {
                     parameters,
                     methodCallCount,
                     instructionCount,
+                    getAllocatedBytes(),
                     getElapsedTimeMs(),
                     System.currentTimeMillis()
             );
@@ -147,8 +176,8 @@ public class MetricRegistry {
 
         @Override
         public String toString() {
-            return String.format("[%s] params=%s, methods=%d, instructions=%d, time=%dms",
-                    requestType, parameters, methodCallCount, instructionCount, getElapsedTimeMs());
+            return String.format("[%s] params=%s, methods=%d, instructions=%d, alloc=%dB, time=%dms",
+                    requestType, parameters, methodCallCount, instructionCount, getAllocatedBytes(), getElapsedTimeMs());
         }
     }
 

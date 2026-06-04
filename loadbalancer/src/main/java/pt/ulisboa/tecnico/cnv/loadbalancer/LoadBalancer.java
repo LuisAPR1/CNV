@@ -16,12 +16,6 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.Executors;
 
-import com.amazonaws.services.lambda.AWSLambda;
-import com.amazonaws.services.lambda.AWSLambdaClientBuilder;
-import com.amazonaws.services.lambda.model.InvokeRequest;
-import com.amazonaws.services.lambda.model.InvokeResult;
-import com.fasterxml.jackson.databind.ObjectMapper;
-
 /**
  * Load Balancer — entry point of the Nature@Cloud system.
  * Receives all HTTP requests and forwards them to available workers.
@@ -40,17 +34,21 @@ public class LoadBalancer {
     private final WorkerPool workerPool;
     private final AutoScaler autoScaler;
     private final ComplexityEstimator complexityEstimator;
+    private final LambdaInvoker lambdaInvoker;
 
-    private static final long LAMBDA_COST_THRESHOLD = 2_000_000_000L;
-    private final AWSLambda lambdaClient;
-    private final ObjectMapper objectMapper;
+    /** Max estimated wall-clock seconds for a request to be Lambda-eligible. */
+    static final double LAMBDA_MAX_SECONDS = Double.parseDouble(
+            System.getProperty("cnv.lambda.maxseconds", "5.0"));
+
+    /** Workers above this fraction of MAX_CAPACITY are considered "busy" for Lambda routing. */
+    static final double WORKER_LOAD_THRESHOLD = Double.parseDouble(
+            System.getProperty("cnv.lambda.loadthreshold", "0.80"));
 
     public LoadBalancer(WorkerPool workerPool) {
         this.workerPool = workerPool;
         this.autoScaler = new AutoScaler(workerPool);
         this.complexityEstimator = new ComplexityEstimator();
-        this.lambdaClient = AWSLambdaClientBuilder.defaultClient();
-        this.objectMapper = new ObjectMapper();
+        this.lambdaInvoker = LambdaInvoker.getInstance();
     }
 
     public void start(int port) throws IOException {
@@ -105,45 +103,28 @@ public class LoadBalancer {
             Map<String, String> params = parseQuery(query);
             ComplexityEstimator.Estimate estimate = complexityEstimator.estimate(requestType, params);
             long estimatedCost = estimate.getEstimatedCost();
-            System.out.println("[LoadBalancer] Complexity estimate for " + path + ": " + estimate);
+            double estimatedCostSeconds = estimatedCost / (WorkerPool.WORKER_THROUGHPUT_INSTR_PER_MS * 1000.0);
+            System.out.println("[LoadBalancer] Complexity estimate for " + path + ": " + estimate
+                    + String.format(" (%.2fs)", estimatedCostSeconds));
 
-            // Cost-based routing decision
-            if (estimatedCost < LAMBDA_COST_THRESHOLD) {
-                System.out.println("[LoadBalancer] Forwarding " + path + " -> AWS Lambda (Cost: " + estimatedCost + ")");
-                try {
-                    String payload = objectMapper.writeValueAsString(params);
-                    InvokeRequest invokeRequest = new InvokeRequest()
-                            .withFunctionName(requestType)
-                            .withPayload(payload);
-                    InvokeResult invokeResult = lambdaClient.invoke(invokeRequest);
-
-                    byte[] responsePayload = invokeResult.getPayload().array();
-                    String resultString = new String(responsePayload, java.nio.charset.StandardCharsets.UTF_8);
-                    
-                    // AWS Lambda Java Core serializes `String` return type as a JSON string literal.
-                    // We need to unescape it so it returns raw HTML/text to the client.
-                    if (resultString.startsWith("\"") && resultString.endsWith("\"")) {
-                        try {
-                            resultString = objectMapper.readValue(resultString, String.class);
-                        } catch (Exception ignored) {}
+            // Lambda fast-path: if all workers are busy AND request is small enough,
+            // skip EC2 entirely and go directly to Lambda.
+            if (estimatedCostSeconds <= LAMBDA_MAX_SECONDS && lambdaInvoker.isAvailable()) {
+                if (allWorkersBusy()) {
+                    System.out.println("[LoadBalancer] All workers busy (>" + (int)(WORKER_LOAD_THRESHOLD*100)
+                            + "%) + request Lambda-eligible — routing directly to Lambda.");
+                    try {
+                        String lambdaResponse = lambdaInvoker.invoke(requestType, params);
+                        byte[] body = lambdaResponse.getBytes();
+                        exchange.sendResponseHeaders(200, body.length);
+                        OutputStream os = exchange.getResponseBody();
+                        os.write(body);
+                        os.close();
+                        return;
+                    } catch (Exception e) {
+                        System.err.println("[LoadBalancer] Lambda fast-path failed: " + e.getMessage());
+                        // Fall through to EC2 attempt.
                     }
-                    byte[] finalBody = resultString.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-                    
-                    int statusCode = invokeResult.getStatusCode() != null ? invokeResult.getStatusCode() : 200;
-                    if (invokeResult.getFunctionError() != null) {
-                        statusCode = 500;
-                        System.err.println("[LoadBalancer] Lambda error: " + invokeResult.getFunctionError());
-                    }
-                    
-                    exchange.sendResponseHeaders(statusCode, finalBody.length);
-                    OutputStream os = exchange.getResponseBody();
-                    os.write(finalBody);
-                    os.close();
-                    return;
-                } catch (Exception e) {
-                    System.err.println("[LoadBalancer] Lambda execution failed: " + e.getMessage());
-                    e.printStackTrace();
-                    System.out.println("[LoadBalancer] Fallback to EC2 worker for " + path);
                 }
             }
 
@@ -203,8 +184,44 @@ public class LoadBalancer {
             }
 
             if (!success) {
+                // Lambda fallback: if EC2 retries exhausted and request is Lambda-eligible,
+                // try Lambda as a last resort (fault tolerance).
+                if (estimatedCostSeconds <= LAMBDA_MAX_SECONDS && lambdaInvoker.isAvailable()) {
+                    System.out.println("[LoadBalancer] EC2 retries exhausted — falling back to Lambda.");
+                    try {
+                        String lambdaResponse = lambdaInvoker.invoke(requestType, params);
+                        byte[] body = lambdaResponse.getBytes();
+                        exchange.sendResponseHeaders(200, body.length);
+                        OutputStream os = exchange.getResponseBody();
+                        os.write(body);
+                        os.close();
+                        return;
+                    } catch (Exception e) {
+                        System.err.println("[LoadBalancer] Lambda fallback also failed: " + e.getMessage());
+                    }
+                }
                 sendError(exchange, 502, "All workers unreachable after " + maxRetries + " attempts");
             }
+        }
+
+        /**
+         * Returns true if ALL workers are above WORKER_LOAD_THRESHOLD of MAX_CAPACITY.
+         * Used to decide whether to route directly to Lambda.
+         */
+        private boolean allWorkersBusy() {
+            // Empty pool → treat as "all busy" so Lambda fast-path triggers.
+            // The fallback would catch this anyway, but fast-path avoids unnecessary EC2 attempts.
+            if (workerPool.getWorkers().isEmpty()) {
+                return true;
+            }
+            long capacity = WorkerPool.DEFAULT_MAX_CAPACITY;
+            long busyThreshold = (long) (capacity * WORKER_LOAD_THRESHOLD);
+            for (WorkerPool.Worker w : workerPool.getWorkers()) {
+                if (w.getEstimatedWork() < busyThreshold) {
+                    return false;
+                }
+            }
+            return true;
         }
 
         private Map<String, String> parseQuery(String query) {

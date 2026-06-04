@@ -1,0 +1,159 @@
+\documentclass[10pt,twocolumn]{article}
+
+% --- Packages ---
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=1.6cm,top=0.9cm,bottom=1.4cm]{geometry}
+\usepackage{times}
+\usepackage{amsmath,amssymb}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{caption}
+\usepackage{titlesec}
+\usepackage{xcolor}
+\usepackage{float}
+
+% --- Compact formatting ---
+\setlength{\parskip}{0.5pt plus 0.5pt}
+\setlength{\parindent}{0pt}
+\setlength{\columnsep}{0.6cm}
+\titlespacing*{\section}{0pt}{4pt}{1.5pt}
+\titlespacing*{\subsection}{0pt}{3pt}{1pt}
+\titleformat{\section}{\normalfont\bfseries\normalsize}{\thesection.}{0.4em}{}
+\titleformat{\subsection}{\normalfont\bfseries\small}{\thesubsection.}{0.3em}{}
+\setlist{nosep,leftmargin=*,topsep=0pt,parsep=0pt}
+\captionsetup{font=small,labelfont=bf,skip=2pt}
+\makeatletter
+\renewcommand{\ALG@beginalgorithmic}{\small}
+\makeatother
+
+% --- Reduce algorithm float spacing ---
+\setlength{\intextsep}{3pt plus 1pt minus 1pt}
+\setlength{\floatsep}{3pt plus 1pt minus 1pt}
+\setlength{\textfloatsep}{3pt plus 1pt minus 1pt}
+
+\begin{document}
+
+% --- Title ---
+\twocolumn[{%
+\begin{center}
+{\Large\bfseries Nature@Cloud --- Checkpoint Report}\\[3pt]
+{\normalsize Cloud Computing and Virtualization, 2025--26, IST}\\[2pt]
+{\small
+Lu\'is Rosa (ist1116307) \quad
+Laura Rodrigues (ist1116260) \quad
+Jo\~ao Guerreiro (ist1116375) --- Group~35}
+\end{center}
+\vspace{4pt}
+}]
+
+\section{Current Implementation}
+
+Our system is fully deployed on AWS with all four components operational: multi-threaded VM Workers (EC2), a Load Balancer with complexity-aware routing, a threshold-based Auto-Scaler with safe scale-down, and a DynamoDB-backed Metrics Storage System (MSS). Deployment is automated via five idempotent Bash scripts, plus an additional one for AWS resource cleanup.
+
+\subsection{Workers}
+
+Each VM worker runs on a \texttt{t3.micro} EC2 instance with a pre-baked AMI containing the application JAR and a systemd service. The web server uses the JDK \texttt{HttpServer} with a \texttt{CachedThreadPool}, exposing \texttt{/fractals}, \texttt{/grayscott}, \texttt{/dna}, and a health-check endpoint. All handlers implement both \texttt{HttpHandler} (EC2) and \texttt{RequestHandler} (Lambda) interfaces, enabling dual deployment.
+
+\subsection{Bytecode Instrumentation (Javassist)}
+
+A \textbf{Java agent} instruments workload classes at load time via \texttt{ClassFileTransformer}, targeting only the three workload packages to minimize overhead. Using Javassist's \texttt{ControlFlow} API, we identify every basic block and inject \texttt{MetricRegistry.incrementInstructions(N)} at each block entry, where $N$ is the block's bytecode instruction count. This yields instruction-level accuracy with per-block overhead (5--15\% vs.\ 40--60\% for per-instruction injection). Blocks are instrumented in descending position order to preserve offsets.
+
+Metrics accumulate in a \texttt{ThreadLocal<RequestMetrics>} accumulator, ensuring \textbf{zero contention} between concurrent requests. On completion, a \texttt{CompletedRequest} snapshot is stored in a bounded \texttt{ConcurrentLinkedDeque} (max 1000) and asynchronously persisted to DynamoDB via a dedicated daemon thread.
+
+\subsection{Composite Metric: CPU + RAM}
+
+The system uses a \textbf{composite cost metric} combining CPU and memory pressure:
+
+\[
+C_{\text{composite}} = w_{\text{CPU}} \times \text{ICount} \;+\; w_{\text{RAM}} \times \text{AllocatedBytes}
+\]
+
+\textbf{ICount} (CPU) is collected via Javassist bytecode instrumentation as described above. \textbf{AllocatedBytes} (RAM) is measured per-thread via \texttt{com.sun.management.ThreadMXBean.getThreadAllocatedBytes()}, a JVM built-in counter with \textbf{zero instrumentation overhead}. Both metrics contribute linearly ($w_{\text{CPU}}\!=\!w_{\text{RAM}}\!=\!1.0$, configurable via \texttt{-Dcnv.estwork.wcpu}, \texttt{-Dcnv.estwork.wram}). In practice, ICount dominates ($\sim$40\,000:1 for a typical GrayScott request) because these workloads are CPU-bound by nature. AllocatedBytes becomes meaningful only in anomalous scenarios (allocations $>$100\,MB), acting as a safeguard against GC pressure rather than a primary cost driver. Method call count is retained as a secondary diagnostic metric.
+
+\subsection{Metrics Storage System (DynamoDB)}
+
+Metrics are stored in table \texttt{cnv-metrics} (partition key: \texttt{requestType}, sort key: \texttt{requestId}). Each record contains \texttt{instructionCount} (CPU), \texttt{allocatedBytes} (RAM), \texttt{methodCallCount} (backup), \texttt{elapsedTimeMs}, and all request parameters (prefixed \texttt{param\_}). The table uses PAY\_PER\_REQUEST billing, is auto-created on first use, and degrades gracefully without AWS credentials.
+
+\subsection{Complexity Estimator}
+
+The LB estimates the \textbf{composite cost} \emph{before} routing with a two-tier strategy:
+
+\textbf{(1) History-based:} Queries the last 50 DynamoDB records, computes separate CPU and RAM ratios per feature, and combines: $\hat{C} = w_{\text{CPU}} \cdot \bar{r}_{\text{CPU}} \cdot f_{\text{new}} + w_{\text{RAM}} \cdot \bar{r}_{\text{RAM}} \cdot f_{\text{new}}$. Features: fractals $= w \!\cdot\! h \!\cdot\! \min(\text{iter}, 500)$; grayscott $= \text{size}^2 \!\cdot\! \text{maxIter}$; dna $= \max(|\text{seq1}|, |\text{seq2}|)$. Results are cached with a 30s TTL.
+
+\textbf{(2) Heuristic fallback:} Calibrated formulas for both CPU and RAM when no history exists (e.g., grayscott CPU: $\text{size}^2 \!\cdot\! \text{maxIter} \!\cdot\! 164$, RAM: $\text{size}^2 \!\cdot\! 20$). \emph{Calibration} (33 measurements): GrayScott CPU ratio $= 164 \pm 0.3\%$ across 3 orders of magnitude; fractals saturate at iter$=500$; DNA scales linearly in max sequence length.
+
+\subsection{Load Balancer}
+
+The LB runs on a dedicated EC2 and uses a \textbf{hybrid packing/spreading} algorithm: it selects the \emph{most-loaded} worker whose projected load (current + estimated cost) stays below \texttt{MAX\_CAPACITY} ($5\!\times\!10^{10}$), consolidating work to enable scale-down. When all workers exceed the cap, it falls back to the \emph{least-loaded} worker. Failed requests are retried on alternative workers (up to 3 retries).
+
+\textbf{Lambda routing:} Requests with estimated wall-clock $\leq 5$s are Lambda-eligible. Two paths: (1) \emph{fast-path}---if all workers exceed 80\% capacity, route directly to Lambda to avoid unnecessary scale-up; (2) \emph{fallback}---if EC2 retries are exhausted, invoke Lambda as a last resort. The 5s threshold ensures Lambda is only used for requests that do not justify a new EC2 instance (cold start $\sim$60s).
+
+\subsection{Auto-Scaler}
+
+Runs every 5s, maintaining 1--5 workers. Thresholds are expressed in wall-clock seconds using calibrated t3.micro throughput ($2.0\!\times\!10^{6}$ instr/ms): scale-up at 2.5s avg.\ pending work per worker, scale-down at 0.6s, with 60s cooldown. \textbf{Safe scale-down}: the worker is removed from the pool and polled for 30s; if active requests remain, it is \emph{re-added} (deferred)---never killing in-flight requests. On startup, existing workers are discovered via EC2 tag queries; unhealthy workers (3 consecutive failed health checks at 15s intervals) are evicted and their EC2 instances terminated.
+
+\section{Remaining Work}
+
+\subsection{Automated Deployment}
+
+Full end-to-end automation: single script to provision all resources (IAM, network, AMI, workers, LB, Lambdas) and tear them down. Currently each component has its own script; orchestration is manual.
+
+\subsection{Final LB and AS Algorithms}
+
+\vspace{-2pt}
+\begin{algorithm}[H]
+\caption{Load Balancing with Lambda Fallback}\label{alg:lb}
+\begin{algorithmic}[1]
+\small
+\Procedure{RouteRequest}{$type, params$}
+  \State $cost \gets$ \Call{EstimateCost}{$type, params$}
+  \If{$cost \leq 5$s \textbf{and} all workers $> 80\%$ full}
+    \State \Return \Call{InvokeLambda}{$type, params$} \Comment{fast-path}
+  \EndIf
+  \State $w \gets$ \Call{SelectWorker}{$cost$} \Comment{pack/spread}
+  \State $w.\text{addLoad}(cost)$
+  \State $resp \gets$ \Call{Forward}{$w, type, params$}
+  \If{failure} \Return \Call{FallbackLambda}{$type, params$}
+  \EndIf
+  \State \Return $resp$
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+\vspace{-4pt}
+\begin{algorithm}[H]
+\caption{Auto-Scaling with Safe Drain}\label{alg:as}
+\begin{algorithmic}[1]
+\small
+\Procedure{CheckAndScale}{}
+  \State $\bar{L} \gets \text{avgEstWork(healthyWorkers)}$
+  \If{cooldown not elapsed} \Return \EndIf
+  \If{$\bar{L} > T_{\text{up}}$ \textbf{and} $|W| < \text{MAX}$}
+    \State \Call{LaunchEC2}{}
+  \ElsIf{$\bar{L} < T_{\text{down}}$ \textbf{and} $|W| > \text{MIN}$}
+    \State $w \gets$ least-loaded managed worker
+    \State Remove $w$ from pool
+    \State \Call{DrainAndTerminate}{$w$}
+  \EndIf
+\EndProcedure
+\Procedure{DrainAndTerminate}{$w$}
+  \For{$i \gets 1$ \textbf{to} \text{MAX\_POLLS}}
+    \If{$w.\text{active} = 0$} \Call{Terminate}{$w$}; \Return \EndIf
+    \State \textbf{sleep}(\text{INTERVAL})
+  \EndFor
+  \State Re-add $w$ to pool \Comment{defer to next cycle}
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+\vspace{-4pt}
+
+\subsection{Additional Improvements}
+
+Lambda cost optimization (tune $\lambda_{\text{thr}}$ to minimize EC2+Lambda total cost), predictive scaling using request arrival rate trends, and comprehensive benchmarking with mixed workloads and cost analysis.
+
+\vspace{3pt}
+\noindent\textbf{Video:} \url{https://youtu.be/PLACEHOLDER}
+
+\end{document}

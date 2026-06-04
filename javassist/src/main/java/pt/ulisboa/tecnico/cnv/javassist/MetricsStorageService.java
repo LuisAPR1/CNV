@@ -109,6 +109,8 @@ public class MetricsStorageService {
                     String.valueOf(request.getMethodCallCount())));
             item.put("instructionCount", new AttributeValue().withN(
                     String.valueOf(request.getInstructionCount())));
+            item.put("allocatedBytes", new AttributeValue().withN(
+                    String.valueOf(request.getAllocatedBytes())));
             item.put("elapsedTimeMs", new AttributeValue().withN(
                     String.valueOf(request.getElapsedTimeMs())));
             item.put("timestamp", new AttributeValue().withN(

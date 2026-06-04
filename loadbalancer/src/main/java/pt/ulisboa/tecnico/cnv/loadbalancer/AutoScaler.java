@@ -28,13 +28,17 @@ import java.util.concurrent.TimeUnit;
  *      = false. Apenas regista decisões nos logs (útil para desenvolvimento local).
  *   2. <b>AWS mode</b>: lança/termina instâncias EC2 via SDK.
  *
- * Estratégia (calibrável):
- *   - Usa estimatedWork (soma dos custos estimados pelo ComplexityEstimator)
- *     em vez de contagem bruta de pedidos ativos.
- *   - Se avgEstimatedWork &gt; ESTIMATED_WORK_THRESHOLD → +1 worker
- *   - Se avgEstimatedWork &lt; ESTIMATED_WORK_THRESHOLD / 4 e numWorkers &gt; MIN_WORKERS → -1 worker
+ * Estratégia de scaling baseada em wall-clock estimado:
+ *   - Converte estimatedWork (instruções compostas) em segundos de wall-clock
+ *     usando o throughput calibrado do t3.micro (2.0×10⁶ instr/ms).
+ *   - Scale-up quando cada worker tem, em média, mais de {@value #SCALE_UP_SECONDS}s
+ *     de trabalho pendente (≈ 1 pedido GrayScott médio).
+ *   - Scale-down quando cada worker tem menos de {@value #SCALE_DOWN_SECONDS}s
+ *     (worker essencialmente idle).
  *   - Cooldown de 60s entre acções para evitar oscilação.
- *   - Cap de 5 workers para não explodir custos durante testes.
+ *   - Cap de {@value #MAX_WORKERS} workers para controlar custos.
+ *
+ * @see <a href="bench-t3micro-throughput.csv">Calibração de throughput t3.micro</a>
  */
 public class AutoScaler {
 
@@ -44,21 +48,39 @@ public class AutoScaler {
     private static final long COOLDOWN_MS = 60_000;
 
     /**
-     * Limiar de trabalho estimado por worker (em <b>instruções bytecode</b>, ICount).
+     * Calibrated throughput of a t3.micro worker in <b>burst mode</b>
+     * (instructions per millisecond).
      *
-     * <p>Calibração 2026-05-21 baseada em medições empíricas locais (ver
-     * {@code docs/01.6_calibration_evidence.md}):
-     * <ul>
-     *   <li>Fractals 1000×1000×500 (heavy): ~880M instr.</li>
-     *   <li>GrayScott 256×1000 (heavy): ~10.8B instr.</li>
-     *   <li>GrayScott 128×2000 (medium): ~5.4B instr.</li>
-     * </ul>
+     * <p>Measured empirically on a t3.micro (2 vCPU burstable, 1 GB RAM,
+     * Amazon Corretto 11, eu-west-1) with 8 representative requests across
+     * all 3 workloads. Average: 2.0×10⁶ instr/ms (σ = 0.18×10⁶).
+     * See {@code bench-t3micro-throughput.csv}.
      *
-     * <p>Limiar fixado em <b>5×10⁹</b> → scale-up quando avg ≈ 1 pedido medium
-     * por worker. Scale-down em {@code THRESHOLD/4} = 1.25×10⁹ (worker
-     * essencialmente idle, com no máximo 1 pedido leve).
+     * <p><b>Note:</b> in sustained baseline mode (10% CPU, no burst credits),
+     * throughput drops to ~0.2×10⁶ instr/ms. The auto-scaler mitigates this
+     * by adding workers before exhausting a single worker's credits.
      */
-    private static final long ESTIMATED_WORK_THRESHOLD = 5_000_000_000L;
+    private static final double WORKER_THROUGHPUT_INSTR_PER_MS = WorkerPool.WORKER_THROUGHPUT_INSTR_PER_MS;
+
+    /**
+     * Scale-up threshold: launch a new worker when average estimated pending
+     * work per worker exceeds this many <b>seconds of wall-clock time</b>
+     * (on the calibrated t3.micro throughput).
+     *
+     * <p>2.5 s ≈ 1 medium GrayScott request (s128×2000) or ~4 heavy Fractals
+     * (1600×1200). Triggers scale-up before users perceive latency degradation.
+     */
+    private static final double SCALE_UP_SECONDS = 2.5;
+
+    /**
+     * Scale-down threshold: terminate the least-loaded worker when average
+     * estimated pending work falls below this many seconds. Worker is
+     * essentially idle at this point.
+     *
+     * <p>0.6 s ≈ 1 lightweight Fractals request (800×600×100).
+     * Ratio scale-up/scale-down = ~4× provides hysteresis to avoid oscillation.
+     */
+    private static final double SCALE_DOWN_SECONDS = 0.6;
 
     /**
      * Tempo máximo (em iterações de 2s) que o scale-down espera por drenagem
@@ -169,11 +191,13 @@ public class AutoScaler {
                 totalEstimatedWork += w.getEstimatedWork();
                 totalActive += w.getActiveRequests();
             }
-            long avgEstimatedWork = numWorkers == 0 ? Long.MAX_VALUE
-                    : totalEstimatedWork / numWorkers;
 
-            System.out.printf("[AutoScaler] Workers=%d, TotalActive=%d, TotalEstWork=%d, AvgEstWork=%d%n",
-                    numWorkers, totalActive, totalEstimatedWork, avgEstimatedWork);
+            // Convert to wall-clock seconds using calibrated throughput.
+            double avgWorkSeconds = numWorkers == 0 ? Double.MAX_VALUE
+                    : totalEstimatedWork / (numWorkers * WORKER_THROUGHPUT_INSTR_PER_MS * 1000.0);
+
+            System.out.printf("[AutoScaler] Workers=%d, TotalActive=%d, TotalEstWork=%d, AvgWorkSeconds=%.2fs%n",
+                    numWorkers, totalActive, totalEstimatedWork, avgWorkSeconds);
 
             // Cooldown — não fazer scaling demasiado depressa.
             if (System.currentTimeMillis() - lastScalingAction < COOLDOWN_MS) {
@@ -183,13 +207,13 @@ public class AutoScaler {
             if (numWorkers < MIN_WORKERS) {
                 System.out.println("[AutoScaler] Abaixo do mínimo (" + MIN_WORKERS + ") — SCALE UP forçado.");
                 scaleUp();
-            } else if (avgEstimatedWork > ESTIMATED_WORK_THRESHOLD && numWorkers < MAX_WORKERS) {
-                System.out.println("[AutoScaler] SCALE UP (avgEstWork=" + avgEstimatedWork
-                        + " > " + ESTIMATED_WORK_THRESHOLD + ")");
+            } else if (avgWorkSeconds > SCALE_UP_SECONDS && numWorkers < MAX_WORKERS) {
+                System.out.printf("[AutoScaler] SCALE UP (avgWork=%.2fs > %.1fs)%n",
+                        avgWorkSeconds, SCALE_UP_SECONDS);
                 scaleUp();
-            } else if (avgEstimatedWork < ESTIMATED_WORK_THRESHOLD / 4 && numWorkers > MIN_WORKERS) {
-                System.out.println("[AutoScaler] SCALE DOWN (avgEstWork=" + avgEstimatedWork
-                        + " < " + (ESTIMATED_WORK_THRESHOLD / 4) + ")");
+            } else if (avgWorkSeconds < SCALE_DOWN_SECONDS && numWorkers > MIN_WORKERS) {
+                System.out.printf("[AutoScaler] SCALE DOWN (avgWork=%.2fs < %.1fs)%n",
+                        avgWorkSeconds, SCALE_DOWN_SECONDS);
                 scaleDown();
             }
         } catch (Exception e) {

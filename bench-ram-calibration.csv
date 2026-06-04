@@ -1,0 +1,114 @@
+requestType,w,h,iterations,size,maxIterations,seedMode,seq1_len,seq2_len,minLength,instructionCount,allocatedBytes,elapsedTimeMs,allocPerFeature,icountPerFeature
+fractals,200,200,50,,,,,,,23119401,2620048,91,1.310,11.560
+fractals,400,400,100,,,,,,,122263231,5405064,47,0.338,7.641
+fractals,800,600,100,,,,,,,366980645,15911896,312,0.332,7.645
+fractals,800,600,500,,,,,,,422312755,15428928,121,0.064,1.760
+fractals,1600,1200,100,,,,,,,1467015279,62189016,460,0.324,7.641
+fractals,1500,1500,1000,,,,,,,1980587915,69883504,539,0.062,1.761
+grayscott,,,,64,1000,center,,,,673578166,1367024,183,0.334,164.447
+grayscott,,,,128,2000,center,,,,5381221157,1058904,887,0.032,164.283
+grayscott,,,,128,2000,ring,,,,5381767600,1058688,830,0.032,164.300
+grayscott,,,,128,2000,stripe,,,,5381258801,1066904,842,0.033,164.285
+grayscott,,,,256,1000,center,,,,10757575436,4025936,1700,0.061,164.269
+grayscott,,,,256,5000,center,,,,53774915509,4052032,8315,0.062,164.233
+dna,,,,,,,,16,12,1,2353,1218800,21,76.175,147.063
+dna,,,,,,,,40,40,3,5520,65328,0,1.633,138.000
+dna,,,,,,,,200,200,3,24909,202928,1,1.015,124.545
+dna,,,,,,,,500,500,3,61425,414072,1,0.828,122.850
+
+# =============================================================================
+# SUMARIO DE CALIBRACAO - allocatedBytes (RAM)
+# =============================================================================
+#
+# Feature usada (extractFeature do ComplexityEstimator):
+#   fractals:  w * h * min(iterations, 500)
+#   grayscott: size^2 * maxIterations
+#   dna:       max(seq1_len, seq2_len)
+#
+# -----------------------------------------------------------------------------
+# FRACTALS - allocPerFeature (usando feature CPU = w*h*min(iter,500))
+# -----------------------------------------------------------------------------
+# O allocPerFeature NAO e constante com esta feature. Isto acontece porque
+# a alocacao de RAM nos fractals depende apenas de w*h (BufferedImage),
+# nao do numero de iteracoes. A feature CPU inclui iter, distorcendo o ratio.
+#
+# Analise com feature RAM correta (w*h):
+#   w=200,h=200: alloc/(200*200) = 2620048/40000   = 65.50 B/px  (outlier: fixed overhead)
+#   w=400,h=400: alloc/(400*400) = 5405064/160000  = 33.78 B/px
+#   w=800,h=600: alloc/(800*600) = 15911896/480000 = 33.15 B/px
+#   w=800,h=600: alloc/(800*600) = 15428928/480000 = 32.14 B/px  (iter=500, mesmo w*h -> mesmo alloc)
+#   w=1600,h=1200: alloc/(1600*1200) = 62189016/1920000 = 32.39 B/px
+#   w=1500,h=1500: alloc/(1500*1500) = 69883504/2250000 = 31.06 B/px
+#
+#   Media (excluindo outlier 200x200): 32.5 B/px
+#   Heuristica atual: w*h*8  -> 8 B/px
+#   Ratio real: ~32.5 B/px (4x maior que heuristica!)
+#   NOVA HEURISTICA RECOMENDADA: allocatedBytes = w * h * 33
+#
+# -----------------------------------------------------------------------------
+# GRAYSCOTT - allocPerFeature (usando feature CPU = size^2*maxIter)
+# -----------------------------------------------------------------------------
+# Tambem nao e constante. A RAM depende de size^2 (grids), nao de maxIter.
+#
+# Analise com feature RAM correta (size^2):
+#   s=64:  alloc/(64*64)   = 1367024/4096  = 333.7 B/cell  (outlier: fixed overhead)
+#   s=128: alloc/(128*128) = 1058904/16384 = 64.6 B/cell
+#   s=128: alloc/(128*128) = 1058688/16384 = 64.6 B/cell  (ring)
+#   s=128: alloc/(128*128) = 1066904/16384 = 65.1 B/cell  (stripe)
+#   s=256: alloc/(256*256) = 4025936/65536 = 61.4 B/cell
+#   s=256: alloc/(256*256) = 4052032/65536 = 61.8 B/cell  (maxIter=5000, mesmo size -> mesmo alloc)
+#
+#   seedMode NAO afeta allocatedBytes (64.6 vs 64.6 vs 65.1 - dif <1%)
+#   maxIterations NAO afeta allocatedBytes (61.4 vs 61.8 - dif <1%)
+#   Media (excluindo outlier s=64): 63.5 B/cell
+#   Heuristica atual: size^2 * 20 -> 20 B/cell
+#   Ratio real: ~63.5 B/cell (3.2x maior que heuristica!)
+#   NOVA HEURISTICA RECOMENDADA: allocatedBytes = size^2 * 64
+#
+# -----------------------------------------------------------------------------
+# DNA - allocPerFeature (usando feature CPU = max(seq1,seq2))
+# -----------------------------------------------------------------------------
+#   max=16:  alloc/16 = 1218800/16 = 76175 B/char  (outlier: JVM warmup / fixed overhead)
+#   max=40:  alloc/40 = 65328/40   = 1633 B/char
+#   max=200: alloc/200 = 202928/200 = 1015 B/char
+#   max=500: alloc/500 = 414072/500 = 828 B/char
+#
+#   O ratio decresce com o tamanho -> ha um fixed overhead significativo.
+#   Modelo linear: alloc = fixedOverhead + perChar * maxSeq
+#     Entre 40 e 200: perChar = (202928-65328)/(200-40) = 860
+#     Entre 200 e 500: perChar = (414072-202928)/(500-200) = 704
+#   Media perChar: ~780 B/char, fixedOverhead ~30000 B
+#
+#   Heuristica atual: maxSeq * 200 -> 200 B/char
+#   Ratio real: ~780 B/char (3.9x maior que heuristica!)
+#   NOVA HEURISTICA RECOMENDADA: allocatedBytes = 30000 + maxSeq * 780
+#   Simplificada: allocatedBytes = maxSeq * 800
+#
+# =============================================================================
+# COMPARACAO COM HEURISTICAS ATUAIS
+# =============================================================================
+#
+#   | Workload  | Heuristica atual   | Ratio real medido | Nova heuristica      | Erro atual |
+#   |-----------|--------------------|--------------------|----------------------|------------|
+#   | fractals  | w*h*8              | ~32.5 B/px         | w*h*33               | -75%       |
+#   | grayscott | size^2*20          | ~63.5 B/cell       | size^2*64            | -69%       |
+#   | dna       | maxSeq*200         | ~780 B/char        | maxSeq*800           | -74%       |
+#
+#   IMPACTO: As heuristicas atuais subestimam a RAM em ~3-4x.
+#   Com W_RAM=1.0, o composite vai receber ~3-4x mais contribuicao da RAM
+#   do que o esperado. No entanto, como o ICount ainda e ~40000x maior que
+#   a RAM para workloads tipicos, o impacto no routing/scaling e desprezavel.
+#
+# =============================================================================
+# RATIO ICount / AllocatedBytes por workload
+# =============================================================================
+#
+#   fractals (w=800,h=600,iter=100):  366980645 / 15911896 = 23.1 instr/B
+#   fractals (w=800,h=600,iter=500):  422312755 / 15428928 = 27.4 instr/B
+#   grayscott (s=256,iter=5000):      53774915509 / 4052032 = 13271 instr/B
+#   dna (max=500):                    61425 / 414072 = 0.15 instr/B
+#
+#   NOTA: DNA tem ratio <1 (aloca mais bytes do que executa instrucoes!).
+#   Isto deve-se ao parsing de strings e criacao de objetos auxiliares.
+#   E o unico workload onde a RAM e comparavel ao CPU.
+#

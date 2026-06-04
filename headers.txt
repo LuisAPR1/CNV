@@ -1,5 +1,0 @@
-HTTP/1.1 200 OK
-Date: Wed, 03 Jun 2026 17:11:22 GMT
-Access-control-allow-origin: *
-Content-length: 1598
-

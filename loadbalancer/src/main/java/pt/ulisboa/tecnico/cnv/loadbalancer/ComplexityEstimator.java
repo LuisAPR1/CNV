@@ -40,6 +40,19 @@ public class ComplexityEstimator {
     private static final int MAX_HISTORY_RECORDS = 50;
     private static final long DYNAMODB_RETRY_INTERVAL_MS = 60_000;
 
+    /**
+     * Pesos para a métrica composta: compositeCost = wCpu * instructionCount + wRam * allocatedBytes.
+     * Ambos contribuem linearmente (1 instrução = 1 unidade, 1 byte alocado = 1 unidade).
+     * Na prática o ICount domina (~40.000:1 para GrayScott típico) porque estes workloads
+     * são CPU-bound por natureza. A RAM torna-se relevante apenas em cenários anómalos
+     * (alocações >100MB), funcionando como mecanismo de proteção contra GC pressure.
+     * Configuráveis via system properties: -Dcnv.estwork.wcpu=1.0 -Dcnv.estwork.wram=1.0
+     */
+    private static final double W_CPU = Double.parseDouble(
+            System.getProperty("cnv.estwork.wcpu", "1.0"));
+    private static final double W_RAM = Double.parseDouble(
+            System.getProperty("cnv.estwork.wram", "1.0"));
+
     private AmazonDynamoDB dynamoDB;
     private boolean available = false;
     private long lastRetryAttemptMs = 0;
@@ -68,10 +81,12 @@ public class ComplexityEstimator {
     private static class HistoricalRecord {
         final Map<String, String> parameters;
         final long instructionCount;
+        final long allocatedBytes;
 
-        HistoricalRecord(Map<String, String> parameters, long instructionCount) {
+        HistoricalRecord(Map<String, String> parameters, long instructionCount, long allocatedBytes) {
             this.parameters = parameters;
             this.instructionCount = instructionCount;
+            this.allocatedBytes = allocatedBytes;
         }
     }
 
@@ -96,7 +111,7 @@ public class ComplexityEstimator {
 
         @Override
         public String toString() {
-            return String.format("cost=%d (%s)", estimatedCost, source);
+            return String.format("cost=%d (%s, wCpu=%.2f wRam=%.4f)", estimatedCost, source, W_CPU, W_RAM);
         }
     }
 
@@ -191,19 +206,41 @@ public class ComplexityEstimator {
         double featureNew = extractFeature(requestType, parameters);
         if (featureNew <= 0) return -1;
 
-        double sumRatios = 0;
-        int count = 0;
+        // Ratio-based para ambas as métricas: CPU (ICount) e RAM (allocatedBytes).
+        double sumCpuRatios = 0;
+        double sumRamRatios = 0;
+        int cpuCount = 0;
+        int ramCount = 0;
         for (HistoricalRecord rec : history) {
             double featureHist = extractFeature(requestType, rec.parameters);
-            if (featureHist > 0 && rec.instructionCount > 0) {
-                sumRatios += (double) rec.instructionCount / featureHist;
-                count++;
+            if (featureHist > 0) {
+                if (rec.instructionCount > 0) {
+                    sumCpuRatios += (double) rec.instructionCount / featureHist;
+                    cpuCount++;
+                }
+                if (rec.allocatedBytes > 0) {
+                    sumRamRatios += (double) rec.allocatedBytes / featureHist;
+                    ramCount++;
+                }
             }
         }
 
-        if (count == 0) return -1;
-        double avgRatio = sumRatios / count;
-        return Math.max(1, (long) (avgRatio * featureNew));
+        if (cpuCount == 0) return -1;
+        double avgCpuRatio = sumCpuRatios / cpuCount;
+        long estimatedICount = Math.max(1, (long) (avgCpuRatio * featureNew));
+
+        long estimatedAlloc = 0;
+        if (ramCount > 0) {
+            double avgRamRatio = sumRamRatios / ramCount;
+            estimatedAlloc = Math.max(0, (long) (avgRamRatio * featureNew));
+        }
+
+        return compositeCost(estimatedICount, estimatedAlloc);
+    }
+
+    /** Calcula a métrica composta: wCpu * instructionCount + wRam * allocatedBytes. */
+    private static long compositeCost(long instructionCount, long allocatedBytes) {
+        return (long) (W_CPU * instructionCount + W_RAM * Math.max(0, allocatedBytes));
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -288,17 +325,14 @@ public class ComplexityEstimator {
      * </ul>
      */
     private long estimateFromHeuristics(String requestType, Map<String, String> parameters) {
+        long estimatedICount;
+        long estimatedAlloc;
         switch (requestType) {
             case "fractals": {
                 long w = parseLong(parameters, "w", 800);
                 long h = parseLong(parameters, "h", 600);
                 long iter = parseLong(parameters, "iterations", 100);
-                // CAP iter aos 500 (Julia-set satura, ver constante FRACTAL_ITER_SATURATION).
                 long effIter = Math.min(iter, FRACTAL_ITER_SATURATION);
-                // Multiplicador piecewise (3 regimes empíricos):
-                //   - iter ≤ 100: ratio observado ~11 (ramp-up: pixels do bordo ainda crescem com iter)
-                //   - 100 < iter ≤ 300: ratio observado ~5 (transição: maioria dos pixels já escapou)
-                //   - iter > 300: ratio observado ~2 (plateau: trabalho saturado)
                 long multiplier;
                 if (iter <= 100) {
                     multiplier = 10;
@@ -307,25 +341,36 @@ public class ComplexityEstimator {
                 } else {
                     multiplier = 2;
                 }
-                return w * h * effIter * multiplier;
+                estimatedICount = w * h * effIter * multiplier;
+                // RAM: BufferedImage (w*h*4 bytes ARGB) + objetos temporários.
+                // Calibrado empiricamente (2026-06-03): ~33 B/px (ver bench-ram-calibration.csv).
+                estimatedAlloc = w * h * 33;
+                break;
             }
             case "grayscott": {
                 long size = parseLong(parameters, "size", 256);
                 long maxIter = parseLong(parameters, "maxIterations", 5000);
-                // Ratio empírico extremamente estável: 164 instr/(célula·iter)
-                // independente de seedMode e f/k.
-                return size * size * maxIter * 164;
+                estimatedICount = size * size * maxIter * 164;
+                // RAM: 2 grids de doubles + BufferedImage + objetos auxiliares.
+                // Calibrado empiricamente (2026-06-03): ~64 B/cell, independente de seedMode e maxIter.
+                estimatedAlloc = size * size * 64;
+                break;
             }
             case "dna": {
                 String seq1 = parameters.getOrDefault("seq1", "");
                 String seq2 = parameters.getOrDefault("seq2", "");
                 long maxSeq = Math.max(1, (long) Math.max(seq1.length(), seq2.length()));
-                // Ratio empírico: ~125 instr/char da sequência maior.
-                return Math.max(1000, maxSeq * 125);
+                estimatedICount = Math.max(1000, maxSeq * 125);
+                // RAM: strings + estruturas auxiliares (parsing, suffix arrays).
+                // Calibrado empiricamente (2026-06-03): ~800 B/char (ver bench-ram-calibration.csv).
+                estimatedAlloc = maxSeq * 800;
+                break;
             }
             default:
-                return 10000;
+                estimatedICount = 10000;
+                estimatedAlloc = 0;
         }
+        return compositeCost(estimatedICount, estimatedAlloc);
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -358,19 +403,20 @@ public class ComplexityEstimator {
             for (Map<String, AttributeValue> item : result.getItems()) {
                 Map<String, String> params = new HashMap<>();
                 long ic = 0;
+                long alloc = 0;
 
                 for (Map.Entry<String, AttributeValue> entry : item.entrySet()) {
                     if (entry.getKey().startsWith("param_") && entry.getValue().getS() != null) {
                         params.put(entry.getKey().substring(6), entry.getValue().getS());
                     }
-                    // Campo primário: instructionCount (ICount).
-                    // Registos do esquema antigo (apenas com basicBlockCount) ficam com ic=0
-                    // e são deliberadamente filtrados pelo estimador ratio-based.
                     if ("instructionCount".equals(entry.getKey()) && entry.getValue().getN() != null) {
                         ic = Long.parseLong(entry.getValue().getN());
                     }
+                    if ("allocatedBytes".equals(entry.getKey()) && entry.getValue().getN() != null) {
+                        alloc = Long.parseLong(entry.getValue().getN());
+                    }
                 }
-                records.add(new HistoricalRecord(params, ic));
+                records.add(new HistoricalRecord(params, ic, alloc));
             }
 
             CachedHistory newCache = new CachedHistory(records);

@@ -91,4 +91,11 @@ aws iam put-role-policy \
     --policy-document "$PASS_ROLE_POLICY" >/dev/null
 ok "  inline policy 'CNV-AllowPassWorkerRole' adicionada à $LB_ROLE_NAME"
 
+# Persist Lambda role ARN for 06-deploy-lambdas.sh.
+LAMBDA_ROLE_ARN=$(aws iam get-role --role-name "$LAMBDA_ROLE_NAME" \
+    --query "Role.Arn" --output text)
+LAMBDA_ROLE_ARN=$(sanitize "$LAMBDA_ROLE_ARN")
+printf '%s' "$LAMBDA_ROLE_ARN" > "$STATE_DIR/lambda-role-arn.txt"
+ok "  Lambda role ARN persistida: $LAMBDA_ROLE_ARN"
+
 ok "IAM concluído. Aguarda ~10s antes de lançar EC2s (propagação IAM)."

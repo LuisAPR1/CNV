@@ -169,26 +169,33 @@ public class WorkerPool {
     }
 
     /**
-     * Per-worker hard cap on accumulated estimated work, in bytecode instructions.
-     * Used by {@link #selectForRequest(long, java.util.Set)} as the upper bound
+     * Per-worker hard cap on accumulated estimated work, expressed in
+     * <b>wall-clock seconds</b> on a calibrated t3.micro.
+     *
+     * <p>Used by {@link #selectForRequest(long, java.util.Set)} as the upper bound
      * of the packing phase: if adding this request would push a worker above
-     * this cap, that worker is excluded from packing (forcing spread to a less
-     * loaded peer or, if none, scale-up at the AutoScaler level).
+     * this cap, that worker is excluded from packing.
      *
-     * <p>Calibration 2026-05-21 based on local empirical measurements (see
-     * {@code docs/01.6_calibration_evidence.md}):
-     * <ul>
-     *   <li>Heaviest single request observed: GrayScott s256 maxIter=1000 ≈ 1.08×10¹⁰.</li>
-     *   <li>Extrapolated worst case (GrayScott 512×10000): ~4.3×10¹¹ instr.</li>
-     *   <li>Pack threshold set at <b>5×10¹⁰</b> = ~5 medium requests or 1 heavy
-     *       request worth of work per worker before triggering spreading.</li>
-     * </ul>
+     * <p>25 seconds ≈ 1 heavy GrayScott request (s256×5000 takes ~25.3s on t3.micro)
+     * or ~5 medium requests. This allows a single worker to absorb one heavy request
+     * without triggering the spreading fallback.
      *
-     * <p>This is intentionally tighter than the previous 4×10¹¹ value — packing
-     * becomes more aggressive about leaving workers idle, which helps the
-     * AutoScaler consolidate during low-load periods.
+     * @see <a href="bench-t3micro-throughput.csv">Calibração de throughput t3.micro</a>
      */
-    public static final long DEFAULT_MAX_CAPACITY = 50_000_000_000L;
+    public static final double MAX_CAPACITY_SECONDS = 25.0;
+
+    /**
+     * Calibrated t3.micro throughput (instr/ms). Shared with AutoScaler.
+     * See {@code bench-t3micro-throughput.csv} for measurement details.
+     */
+    static final double WORKER_THROUGHPUT_INSTR_PER_MS = 2_000_000.0;
+
+    /**
+     * MAX_CAPACITY in raw instruction units, derived from wall-clock target.
+     * Used internally for comparison with estimatedWork (which is in instructions).
+     */
+    public static final long DEFAULT_MAX_CAPACITY =
+            (long) (MAX_CAPACITY_SECONDS * WORKER_THROUGHPUT_INSTR_PER_MS * 1000);
 
     /**
      * Select the next worker using round-robin.
