@@ -1,0 +1,43 @@
+Single-feature R^2 for instructionCount
+  maxSeq       R2= 0.2184 slope=   5904.5413 intercept=   -670181.2
+  sumSeq       R2= 0.2794 slope=   3679.7200 intercept=  -1094978.4
+  product      R2= 0.2910 slope=      6.6064 intercept=    259976.6
+  searchSpace  R2= 0.2868 slope=      6.6356 intercept=    292568.8
+  seedPresenceScan R2= 0.9994 slope=     17.1141 intercept=    -13433.6
+  seedMisses   R2= 0.6723 slope=  11519.2615 intercept=   -453512.0
+  seedHits     R2= 0.0808 slope=  -3939.2460 intercept=   2996649.5
+  seq2Kmers    R2= 0.3187 slope=  11838.4165 intercept=   1017620.9
+  renderWork   R2= 0.2794 slope=   3679.7200 intercept=  -1094978.4
+  minLength    R2= 0.0375 slope= 257309.4080 intercept=     61758.2
+  stopOnFirst  R2= 0.0300 slope=-2409593.3810 intercept=   2475038.7
+
+Two-feature R^2 for instructionCount
+  seedPresenceScan+renderWork         R2= 0.9994 beta=[-23916.17790196825, 17.09533802880776, 14.506666156783508]
+  seedPresenceScan+sumSeq             R2= 0.9994 beta=[-23916.17790196825, 17.09533802880776, 14.506666156783508]
+  seedMisses+sumSeq             R2= 0.7149 beta=[-1555316.9071209943, 10193.332971120908, 1580.7434374759862]
+  searchSpace+renderWork         R2= 0.2918 beta=[-317921.3523281991, 4.148838081891853, 1480.8791388109971]
+  searchSpace+sumSeq             R2= 0.2918 beta=[-317921.3523281991, 4.148838081891853, 1480.8791388109971]
+  product+sumSeq             R2= 0.2943 beta=[-241270.58613730024, 4.55819846570768, 1232.1951582984445]
+  maxSeq+searchSpace        R2= 0.2907 beta=[-49612.933813047595, 1324.4662645864337, 5.5923544456690975]
+  methodCalls+allocatedBytes     R2= 0.9927 beta=[-37541.14838992059, -61.39319586878992, 0.3227257791663112]
+
+Single-feature R^2 for allocatedBytes
+  maxSeq       R2= 0.2218 slope=  18395.5372 intercept=  -1892253.8
+  sumSeq       R2= 0.2856 slope=  11501.8849 intercept=  -3249244.4
+  renderWork   R2= 0.2856 slope=  11501.8849 intercept=  -3249244.4
+  product      R2= 0.2999 slope=     20.7365 intercept=    960898.5
+  searchSpace  R2= 0.2954 slope=     20.8223 intercept=   1064890.7
+  seedPresenceScan R2= 0.9922 slope=     52.7197 intercept=    230427.2
+
+Single-feature R^2 for methodCallCount
+  maxSeq       R2= 0.5671 slope=      1.1214 intercept=        70.0
+  sumSeq       R2= 0.7068 slope=      0.6898 intercept=        -2.6
+  product      R2= 0.6863 slope=      0.0012 intercept=       263.7
+  searchSpace  R2= 0.6853 slope=      0.0012 intercept=       267.4
+  seedPresenceScan R2= 0.0340 slope=      0.0004 intercept=       562.6
+  seedMisses   R2= 0.0221 slope=      0.2459 intercept=       554.0
+  seedHits     R2= 0.6158 slope=      1.2818 intercept=       342.4
+  seq2Kmers    R2= 0.0117 slope=      0.2668 intercept=       584.1
+  renderWork   R2= 0.7068 slope=      0.6898 intercept=        -2.6
+  minLength    R2= 0.0036 slope=     -9.4306 intercept=       687.5
+  stopOnFirst  R2= 0.1089 slope=    541.1905 intercept=       542.5

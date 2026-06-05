@@ -87,10 +87,25 @@ estimatedCostSeconds ≤ 5.0s?
 
 ---
 
-## Thresholds (inalterados)
+## 5. Estimador DNA com duas features (2026-06-05)
 
-| Constante | Valor | Significado |
-|---|---|---|
-| `MAX_CAPACITY` | 5×10¹⁰ (25s wall-clock) | Packing cap por worker |
-| Scale-up | 2.5s avg/worker | Dispara AutoScaler |
-| Scale-down | 0.6s avg/worker | Reduz workers |
+Benchmark local com 24 pedidos DNA mostrou que features simples como `maxSeq`, `sumSeq`, `product` ou `searchSpace` explicam mal o `instructionCount` em casos mistos (`R²≈0.22–0.29`). A nova feature `seedPresenceScan` distingue casos com seeds ausentes/presentes em `seq2` sem executar o matcher completo, atingindo `R²=0.999` para `instructionCount` e `R²=0.992` para `allocatedBytes`.
+
+| Métrica estimada | Fórmula fallback |
+|---|---|
+| CPU / ICount | `17 × seedPresenceScan + 60 × (len(seq1)+len(seq2))` |
+| RAM / allocatedBytes | `52 × seedPresenceScan + 480 × (len(seq1)+len(seq2))` |
+
+Evidência: `docs/evidence-dna-feature-benchmark/dna-feature-benchmark.csv` e `dna-feature-summary.txt`.
+
+---
+
+## Thresholds do AutoScaler em percentagem
+
+Os thresholds passaram a ser expressos como percentagem da capacidade calibrada por worker.
+
+| Constante | Valor | Equivalência | Significado |
+|---|---:|---:|---|
+| `MAX_CAPACITY` | 5×10¹⁰ = 100% | 25s wall-clock | Packing cap por worker |
+| Scale-up | 80% avg/worker | 20s avg/worker | Dispara AutoScaler |
+| Scale-down | 20% avg/worker | 5s avg/worker | Reduz workers |

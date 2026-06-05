@@ -28,13 +28,13 @@ import java.util.concurrent.TimeUnit;
  *      = false. Apenas regista decisões nos logs (útil para desenvolvimento local).
  *   2. <b>AWS mode</b>: lança/termina instâncias EC2 via SDK.
  *
- * Estratégia de scaling baseada em wall-clock estimado:
- *   - Converte estimatedWork (instruções compostas) em segundos de wall-clock
- *     usando o throughput calibrado do t3.micro (2.0×10⁶ instr/ms).
- *   - Scale-up quando cada worker tem, em média, mais de {@value #SCALE_UP_SECONDS}s
- *     de trabalho pendente (≈ 1 pedido GrayScott médio).
- *   - Scale-down quando cada worker tem menos de {@value #SCALE_DOWN_SECONDS}s
- *     (worker essencialmente idle).
+ * Estratégia de scaling baseada em percentagem de capacidade:
+ *   - Cada worker tem uma capacidade calibrada {@link WorkerPool#DEFAULT_MAX_CAPACITY},
+ *     equivalente a {@link WorkerPool#MAX_CAPACITY_SECONDS}s de trabalho num t3.micro.
+ *   - O AutoScaler calcula a utilização média do cluster como:
+ *     totalEstimatedWork / (numWorkers × DEFAULT_MAX_CAPACITY).
+ *   - Scale-up quando a utilização média excede 80% por omissão.
+ *   - Scale-down quando a utilização média fica abaixo de 20% por omissão.
  *   - Cooldown de 60s entre acções para evitar oscilação.
  *   - Cap de {@value #MAX_WORKERS} workers para controlar custos.
  *
@@ -48,39 +48,29 @@ public class AutoScaler {
     private static final long COOLDOWN_MS = 60_000;
 
     /**
-     * Calibrated throughput of a t3.micro worker in <b>burst mode</b>
-     * (instructions per millisecond).
+     * Scale-up threshold as average worker capacity utilization percentage.
      *
-     * <p>Measured empirically on a t3.micro (2 vCPU burstable, 1 GB RAM,
-     * Amazon Corretto 11, eu-west-1) with 8 representative requests across
-     * all 3 workloads. Average: 2.0×10⁶ instr/ms (σ = 0.18×10⁶).
-     * See {@code bench-t3micro-throughput.csv}.
+     * <p>80% of {@link WorkerPool#MAX_CAPACITY_SECONDS} means scaling out when
+     * each worker has, on average, about 20s of the calibrated 25s capacity
+     * already assigned. This keeps one heavy request per worker as the practical
+     * upper bound while still leaving headroom for new arrivals.
      *
-     * <p><b>Note:</b> in sustained baseline mode (10% CPU, no burst credits),
-     * throughput drops to ~0.2×10⁶ instr/ms. The auto-scaler mitigates this
-     * by adding workers before exhausting a single worker's credits.
+     * <p>Configurable with {@code -Dcnv.autoscaler.scaleup.percent=80.0}.
      */
-    private static final double WORKER_THROUGHPUT_INSTR_PER_MS = WorkerPool.WORKER_THROUGHPUT_INSTR_PER_MS;
+    private static final double SCALE_UP_PERCENT = Double.parseDouble(
+            System.getProperty("cnv.autoscaler.scaleup.percent", "80.0"));
 
     /**
-     * Scale-up threshold: launch a new worker when average estimated pending
-     * work per worker exceeds this many <b>seconds of wall-clock time</b>
-     * (on the calibrated t3.micro throughput).
+     * Scale-down threshold as average worker capacity utilization percentage.
      *
-     * <p>2.5 s ≈ 1 medium GrayScott request (s128×2000) or ~4 heavy Fractals
-     * (1600×1200). Triggers scale-up before users perceive latency degradation.
-     */
-    private static final double SCALE_UP_SECONDS = 2.5;
-
-    /**
-     * Scale-down threshold: terminate the least-loaded worker when average
-     * estimated pending work falls below this many seconds. Worker is
-     * essentially idle at this point.
+     * <p>20% of {@link WorkerPool#MAX_CAPACITY_SECONDS} means scaling in only
+     * when the average worker has at most about 5s of work assigned. The 80%/20%
+     * gap provides 4× hysteresis to avoid oscillation.
      *
-     * <p>0.6 s ≈ 1 lightweight Fractals request (800×600×100).
-     * Ratio scale-up/scale-down = ~4× provides hysteresis to avoid oscillation.
+     * <p>Configurable with {@code -Dcnv.autoscaler.scaledown.percent=20.0}.
      */
-    private static final double SCALE_DOWN_SECONDS = 0.6;
+    private static final double SCALE_DOWN_PERCENT = Double.parseDouble(
+            System.getProperty("cnv.autoscaler.scaledown.percent", "20.0"));
 
     /**
      * Tempo máximo (em iterações de 2s) que o scale-down espera por drenagem
@@ -192,12 +182,15 @@ public class AutoScaler {
                 totalActive += w.getActiveRequests();
             }
 
-            // Convert to wall-clock seconds using calibrated throughput.
-            double avgWorkSeconds = numWorkers == 0 ? Double.MAX_VALUE
-                    : totalEstimatedWork / (numWorkers * WORKER_THROUGHPUT_INSTR_PER_MS * 1000.0);
+            // Average utilization as a percentage of calibrated per-worker capacity.
+            double avgCapacityPercent = numWorkers == 0 ? Double.POSITIVE_INFINITY
+                    : 100.0 * totalEstimatedWork / (numWorkers * (double) WorkerPool.DEFAULT_MAX_CAPACITY);
+            double avgWorkSeconds = Double.isInfinite(avgCapacityPercent) ? Double.POSITIVE_INFINITY
+                    : (avgCapacityPercent / 100.0) * WorkerPool.MAX_CAPACITY_SECONDS;
 
-            System.out.printf("[AutoScaler] Workers=%d, TotalActive=%d, TotalEstWork=%d, AvgWorkSeconds=%.2fs%n",
-                    numWorkers, totalActive, totalEstimatedWork, avgWorkSeconds);
+            System.out.printf("[AutoScaler] Workers=%d, TotalActive=%d, TotalEstWork=%d, AvgCapacity=%.1f%% (%.2fs of %.1fs cap)%n",
+                    numWorkers, totalActive, totalEstimatedWork,
+                    avgCapacityPercent, avgWorkSeconds, WorkerPool.MAX_CAPACITY_SECONDS);
 
             // Cooldown — não fazer scaling demasiado depressa.
             if (System.currentTimeMillis() - lastScalingAction < COOLDOWN_MS) {
@@ -207,13 +200,13 @@ public class AutoScaler {
             if (numWorkers < MIN_WORKERS) {
                 System.out.println("[AutoScaler] Abaixo do mínimo (" + MIN_WORKERS + ") — SCALE UP forçado.");
                 scaleUp();
-            } else if (avgWorkSeconds > SCALE_UP_SECONDS && numWorkers < MAX_WORKERS) {
-                System.out.printf("[AutoScaler] SCALE UP (avgWork=%.2fs > %.1fs)%n",
-                        avgWorkSeconds, SCALE_UP_SECONDS);
+            } else if (avgCapacityPercent > SCALE_UP_PERCENT && numWorkers < MAX_WORKERS) {
+                System.out.printf("[AutoScaler] SCALE UP (avgCapacity=%.1f%% > %.1f%%)%n",
+                        avgCapacityPercent, SCALE_UP_PERCENT);
                 scaleUp();
-            } else if (avgWorkSeconds < SCALE_DOWN_SECONDS && numWorkers > MIN_WORKERS) {
-                System.out.printf("[AutoScaler] SCALE DOWN (avgWork=%.2fs < %.1fs)%n",
-                        avgWorkSeconds, SCALE_DOWN_SECONDS);
+            } else if (avgCapacityPercent < SCALE_DOWN_PERCENT && numWorkers > MIN_WORKERS) {
+                System.out.printf("[AutoScaler] SCALE DOWN (avgCapacity=%.1f%% < %.1f%%)%n",
+                        avgCapacityPercent, SCALE_DOWN_PERCENT);
                 scaleDown();
             }
         } catch (Exception e) {

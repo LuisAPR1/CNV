@@ -6,11 +6,15 @@ import com.amazonaws.services.dynamodbv2.model.AttributeValue;
 import com.amazonaws.services.dynamodbv2.model.QueryRequest;
 import com.amazonaws.services.dynamodbv2.model.QueryResult;
 
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -39,6 +43,18 @@ public class ComplexityEstimator {
     private static final long CACHE_TTL_MS = 30_000;
     private static final int MAX_HISTORY_RECORDS = 50;
     private static final long DYNAMODB_RETRY_INTERVAL_MS = 60_000;
+
+    /**
+     * DNA feature calibrada em docs/evidence-dna-feature-benchmark.
+     * seedPresenceScan estima quanto trabalho findSeed() faz sem repetir a procura
+     * O(n1*n2): indexa k-mers de seq2 num HashSet e conta se cada seed de seq1
+     * provavelmente força scan completo ou encontra cedo.
+     */
+    private static final long DNA_MIN_FEATURE = 1L;
+    private static final long DNA_CPU_PER_SEED_SCAN = 17L;
+    private static final long DNA_CPU_PER_BASE_OUTPUT = 60L;
+    private static final long DNA_ALLOC_PER_SEED_SCAN = 52L;
+    private static final long DNA_ALLOC_PER_BASE_OUTPUT = 480L;
 
     /**
      * Pesos para a métrica composta: compositeCost = wCpu * instructionCount + wRam * allocatedBytes.
@@ -87,6 +103,16 @@ public class ComplexityEstimator {
             this.parameters = parameters;
             this.instructionCount = instructionCount;
             this.allocatedBytes = allocatedBytes;
+        }
+    }
+
+    private static class DnaFeatures {
+        final long seedPresenceScan;
+        final long sequenceOutputSize;
+
+        DnaFeatures(long seedPresenceScan, long sequenceOutputSize) {
+            this.seedPresenceScan = Math.max(DNA_MIN_FEATURE, seedPresenceScan);
+            this.sequenceOutputSize = Math.max(1L, sequenceOutputSize);
         }
     }
 
@@ -289,13 +315,12 @@ public class ComplexityEstimator {
                 return size * size * maxIter;
             }
             case "dna": {
-                // Trabalho ~linear no comprimento da sequência MAIOR (não no
-                // produto): 4 medições entre 16 e 500 chars deram
-                // instr/max(seq1,seq2) entre 123 e 149 (variância <20%).
-                // minLength e stopOnFirst não tiveram efeito mensurável.
-                String seq1 = parameters.getOrDefault("seq1", "");
-                String seq2 = parameters.getOrDefault("seq2", "");
-                return Math.max(1, (double) Math.max(seq1.length(), seq2.length()));
+                // Ao contrário de fractals/GrayScott, DNA não é bem explicado por
+                // max(seq1,seq2) ou seq1*seq2: pedidos com o mesmo tamanho podem
+                // variar >100× dependendo de as seeds existirem em seq2. A feature
+                // seedPresenceScan aproxima esse comportamento com um HashSet de
+                // k-mers de seq2, sem executar o matcher completo.
+                return (double) extractDnaFeatures(parameters).seedPresenceScan;
             }
             default:
                 return 1.0;
@@ -320,8 +345,9 @@ public class ComplexityEstimator {
      *   <li><b>grayscott</b>: ratio = 164 instr/(célula·iter) com variância
      *       &lt;1% (confirmado em 11 medições cobrindo s64 a s384,
      *       3 seedModes, e f/k diferentes).</li>
-     *   <li><b>dna</b>: linear em max(seq1.length, seq2.length) com ratio
-     *       ~125 instr/char (variância &lt;20% em 4 medições entre 16 e 500 chars).</li>
+     *   <li><b>dna</b>: usa duas dimensões simples: procura de seeds
+     *       ({@code seedPresenceScan}) + tamanho de output/parsing
+     *       ({@code len(seq1)+len(seq2)}), calibradas em 24 pedidos locais.</li>
      * </ul>
      */
     private long estimateFromHeuristics(String requestType, Map<String, String> parameters) {
@@ -357,13 +383,19 @@ public class ComplexityEstimator {
                 break;
             }
             case "dna": {
-                String seq1 = parameters.getOrDefault("seq1", "");
-                String seq2 = parameters.getOrDefault("seq2", "");
-                long maxSeq = Math.max(1, (long) Math.max(seq1.length(), seq2.length()));
-                estimatedICount = Math.max(1000, maxSeq * 125);
-                // RAM: strings + estruturas auxiliares (parsing, suffix arrays).
-                // Calibrado empiricamente (2026-06-03): ~800 B/char (ver bench-ram-calibration.csv).
-                estimatedAlloc = maxSeq * 800;
+                DnaFeatures f = extractDnaFeatures(parameters);
+                // CPU: seedPresenceScan explica os casos caros onde muitas seeds de
+                // seq1 não existem em seq2 e findSeed() faz scans completos. O termo
+                // sequenceOutputSize cobre parsing, arrays de matched bases e HTML.
+                estimatedICount = Math.max(1000,
+                        saturatingAdd(
+                                saturatingMultiply(f.seedPresenceScan, DNA_CPU_PER_SEED_SCAN),
+                                saturatingMultiply(f.sequenceOutputSize, DNA_CPU_PER_BASE_OUTPUT)));
+                // RAM: correlaciona com o mesmo trabalho de procura (substrings)
+                // mais buffers/HTML proporcionais ao tamanho das sequências.
+                estimatedAlloc = saturatingAdd(
+                        saturatingMultiply(f.seedPresenceScan, DNA_ALLOC_PER_SEED_SCAN),
+                        saturatingMultiply(f.sequenceOutputSize, DNA_ALLOC_PER_BASE_OUTPUT));
                 break;
             }
             default:
@@ -371,6 +403,72 @@ public class ComplexityEstimator {
                 estimatedAlloc = 0;
         }
         return compositeCost(estimatedICount, estimatedAlloc);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Features específicas do DNA
+    // ─────────────────────────────────────────────────────────────
+
+    private DnaFeatures extractDnaFeatures(Map<String, String> parameters) {
+        String seq1 = normalizeDnaSequence(parameters.getOrDefault("seq1", "seq1:ATGC"));
+        String seq2 = normalizeDnaSequence(parameters.getOrDefault("seq2", "seq2:ATGC"));
+        int minLength = (int) Math.max(1L, parseLong(parameters, "minLength", 1));
+
+        long outputSize = (long) seq1.length() + seq2.length();
+        long seedPresenceScan = estimateSeedPresenceScan(seq1, seq2, minLength);
+        return new DnaFeatures(seedPresenceScan, outputSize);
+    }
+
+    private String normalizeDnaSequence(String raw) {
+        if (raw == null) return "";
+        String decoded;
+        try {
+            decoded = URLDecoder.decode(raw, StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            decoded = raw;
+        }
+
+        int colon = decoded.indexOf(':');
+        String fasta = colon >= 0 ? decoded.substring(colon + 1) : decoded;
+
+        StringBuilder seq = new StringBuilder(fasta.length());
+        for (String line : fasta.split("\\n")) {
+            String trimmed = line.trim();
+            if (!trimmed.isEmpty() && !trimmed.startsWith(">") && !trimmed.startsWith(";")) {
+                seq.append(trimmed.toUpperCase());
+            }
+        }
+        return seq.toString();
+    }
+
+    private long estimateSeedPresenceScan(String seq1, String seq2, int minLength) {
+        if (seq1.length() < minLength || seq2.length() < minLength) {
+            return DNA_MIN_FEATURE;
+        }
+
+        Set<String> seq2Seeds = new HashSet<>();
+        for (int j = 0; j <= seq2.length() - minLength; j++) {
+            seq2Seeds.add(seq2.substring(j, j + minLength));
+        }
+
+        long fullScan = (long) seq2.length() - minLength + 1;
+        long scan = 0;
+        for (int i = 0; i <= seq1.length() - minLength; i++) {
+            String seed = seq1.substring(i, i + minLength);
+            scan = saturatingAdd(scan, seq2Seeds.contains(seed) ? 1L : fullScan);
+        }
+        return Math.max(DNA_MIN_FEATURE, scan);
+    }
+
+    private long saturatingAdd(long a, long b) {
+        if (Long.MAX_VALUE - a < b) return Long.MAX_VALUE;
+        return a + b;
+    }
+
+    private long saturatingMultiply(long a, long b) {
+        if (a == 0 || b == 0) return 0;
+        if (a > Long.MAX_VALUE / b) return Long.MAX_VALUE;
+        return a * b;
     }
 
     // ─────────────────────────────────────────────────────────────

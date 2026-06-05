@@ -113,12 +113,12 @@ echo "YES" | ./99-cleanup.sh --deep
 2. **Heuristic (fallback):** Uses calibrated parameter-based formulas when no history is available:
    - **Fractals:** piecewise multiplier based on iteration count (saturation at 500)
    - **Gray-Scott:** `size² × maxIterations × 164`
-   - **DNA:** `max(seq1, seq2) × 125`
+   - **DNA:** content-aware seed feature: `17 × seedPresenceScan + 60 × (len(seq1)+len(seq2))`
 
 ### AutoScaler
 
-- **Scale-up:** When `avgEstWork > 5×10⁹`, launches a new worker from the AMI
-- **Scale-down:** When `avgEstWork < 1.25×10⁹` for a sustained period, drains and terminates the least-loaded worker
+- **Scale-up:** When average worker capacity usage exceeds `80%`, launches a new worker from the AMI
+- **Scale-down:** When average worker capacity usage falls below `20%` for a sustained period, drains and terminates the least-loaded worker
 - **Health checks:** Every 15s; workers failing 3 consecutive checks are removed
 
 ### Load Balancing
@@ -129,13 +129,14 @@ echo "YES" | ./99-cleanup.sh --deep
 
 ### Metrics (DynamoDB)
 
-Each completed request stores:
+Completed-request metrics are buffered in memory and flushed to DynamoDB every 15s using `BatchWriteItem` batches of up to 25 items. Each stored request record contains:
 
 | Field | Type | Description |
 |---|---|---|
 | `requestId` | String | Unique ID (timestamp + random) |
 | `requestType` | String | `fractals`, `grayscott`, or `dna` |
 | `instructionCount` | Number | Bytecode instructions executed |
+| `allocatedBytes` | Number | Bytes allocated by the request thread |
 | `methodCallCount` | Number | Method invocations |
 | `elapsedTimeMs` | Number | Wall-clock execution time |
 | `param_*` | String | Request parameters |
@@ -184,9 +185,9 @@ Each completed request stores:
 
 | Parameter | Value | Description |
 |---|---|---|
-| `ESTIMATED_WORK_THRESHOLD` | `5×10⁹` (5B) | Scale-up when `avgEstWork` exceeds this |
-| `SCALE_DOWN_THRESHOLD` | `1.25×10⁹` (1.25B) | Scale-down when `avgEstWork` below this |
-| `MAX_CAPACITY` | `5×10¹⁰` (50B) | Max estimated work per worker (packing) |
+| `SCALE_UP_PERCENT` | `80%` | Scale-up when average worker capacity usage exceeds this |
+| `SCALE_DOWN_PERCENT` | `20%` | Scale-down when average worker capacity usage falls below this |
+| `MAX_CAPACITY` | `5×10¹⁰` (50B = 100%) | Max estimated work per worker (packing) |
 | Check interval | 5s | AutoScaler evaluation loop |
 | Health check interval | 15s | Worker health probe |
 | Health failures before removal | 3 | Consecutive failures to trigger removal |
@@ -206,8 +207,8 @@ Each completed request stores:
 | Component | Status |
 |---|---|
 | Bytecode instrumentation | Javassist agent (ICount + method calls + basic blocks) |
-| Metrics collected | `instructionCount`, `methodCallCount`, `elapsedTimeMs` |
-| Storage | DynamoDB table `cnv-metrics` (beyond checkpoint: not just files) |
+| Metrics collected | `instructionCount`, `allocatedBytes`, `methodCallCount`, `elapsedTimeMs` |
+| Storage | DynamoDB table `cnv-metrics`, buffered and flushed every 15s via `BatchWriteItem` |
 | Complexity estimation | 2-tier: ratio-based (history) + heuristic (fallback) |
 
 ## Group
